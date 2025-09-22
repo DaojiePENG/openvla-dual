@@ -38,6 +38,7 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.action_heads import VisionActionHead # 新增：视觉-动作融合头
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -64,6 +65,9 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# 新增视觉模型相关
+import timm
+from timm.models.vision_transformer import VisionTransformer
 
 @dataclass
 class FinetuneConfig:
@@ -83,6 +87,11 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_vision_action_head: bool = False             # 新增: 是否使用视觉-动作融合头
+    vision_model_id: str = "vit_large_patch14_dinov2.lvd142m"  # 新增: 视觉模型ID (DINOv2-L)
+    frozen_vision_model: bool = True                 # 新增: 是否冻结视觉模型参数，仅训练视觉-动作融合头
+    debug: bool = False                              # 新增: 是否开启debug模式，打印更多信息
+
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -174,6 +183,11 @@ def get_run_id(cfg) -> str:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
         if cfg.image_aug:
             run_id += "--image_aug"
+        # 新增: 添加视觉动作头标识
+        if cfg.use_vision_action_head:
+            run_id += "--vision_action_head"
+        if cfg.frozen_vision_model:
+            run_id += "--frozen_vision"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -281,6 +295,12 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    # 新增: 视觉模型相关参数
+    vision_model=None,
+    use_vision_action_head=False,
+    frozen_vision_model=True,
+    # 新增：debug信息
+    debug=False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -301,6 +321,9 @@ def run_forward_pass(
         compute_diffusion_l1 (bool): Whether to sample actions and compute L1 loss for diffusion (do this once every
                                     diffusion_sample_freq steps during training; do it every batch for validation)
         num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
+        vision_model: 视觉特征提取模型实例
+        use_vision_action_head: 是否使用视觉-动作融合头
+        frozen_vision_model: 是否冻结视觉模型参数
 
     Returns:
         tuple: (loss, metrics_dict)
@@ -322,6 +345,58 @@ def run_forward_pass(
         )
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+
+
+    # 新增: 提取视觉特征，供视觉-动作融合头使用，仅在使用视觉-动作融合头且使用L1回归时进行
+    vision_hidden_states = None
+    vision_hidden_states = None
+    if use_vision_action_head and use_l1_regression and vision_model is not None:
+        with torch.no_grad():  # 冻结视觉模型时使用no_grad
+            # 1. 处理原始 pixel_values: [B, 12, H, W] (2张图 × 6通道/图)
+            pixel_values = batch["pixel_values"].to(device_id, dtype=torch.bfloat16)
+            if debug:
+                print(f"原始 pixel_values 形状: {pixel_values.shape}")  # 预期: [1, 12, 224, 224]
+
+            # 2. 按6通道拆分得到单张图（对应 self.get_num_images_in_input()=2 张图）
+            # 每张图形状变为: [B, 6, H, W] (6通道: 3 for SigLIP + 3 for DINOv2)
+            # num_images = cfg.num_images_in_input
+            num_images = vla.module.vision_backbone.get_num_images_in_input()  # 获取输入图片数量（此处为2）
+            images = torch.split(pixel_values, [6] * num_images, dim=1)  # 按通道维度拆分，得到列表[图1, 图2]
+            if debug:
+                print(f"拆分后单张图形状: {images[0].shape}")  # 预期: [1, 6, 224, 224]
+
+            # 3. 选择目标图片（根据任务需求选第1张或第2张，此处以第0张为例）
+            target_image_idx = 0  # 0=第一张图，1=第二张图，可根据需求修改
+            target_image_6ch = images[target_image_idx]  # [B, 6, H, W]
+
+            # 4. 从6通道中提取 DINOv2 专用的3通道（关键步骤！）
+            # 假设通道分配：前3通道=SigLIP，后3通道=DINOv2（若实际相反，改为[:, :3, :, :]）
+            dino2_image_3ch = target_image_6ch[:, 3:, :, :]  # [B, 3, H, W]，取后3通道给DINOv2
+            if debug:
+                print(f"DINOv2 输入形状: {dino2_image_3ch.shape}")  # 预期: [1, 3, 224, 224]
+
+            # 5. 校验通道数，确保符合视觉模型要求
+            if dino2_image_3ch.shape[1] != 3:
+                raise ValueError(f"DINOv2 需3通道输入，实际得到 {dino2_image_3ch.shape[1]} 通道")
+
+            # 6. 视觉模型前向传播，输出特征
+            # vision_hidden_states = vision_model.module(dino2_image_3ch)  # 输出形状: [B, seq_len, 1024]
+            # 适配DDP和LoRA包装的情况
+            if isinstance(vision_model, DDP):
+                # 先获取DDP包装的内部模型（可能是PeftModel或原始模型）
+                inner_model = vision_model.module
+                if hasattr(inner_model, 'base_model'):
+                    # 如果是LoRA模型，使用base_model.forward获取特征
+                    vision_hidden_states = inner_model.base_model(dino2_image_3ch)
+                else:
+                    # 非LoRA模型，直接调用内部模型
+                    vision_hidden_states = inner_model(dino2_image_3ch)
+            else:
+                # 未使用DDP的情况
+                vision_hidden_states = vision_model(dino2_image_3ch)
+            if debug:
+                print(f"视觉模型输出形状: {vision_hidden_states.shape}")  # 预期: [1, 151, 1024]（DINOv2-L特征）
+
 
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -384,8 +459,12 @@ def run_forward_pass(
         )  # (B, act_chunk_len, D)
 
         if use_l1_regression:
-            # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            # 新增： 根据是否使用视觉动作头选择不同的预测方式
+            if use_vision_action_head:
+                predicted_actions = action_head.module(actions_hidden_states, vision_hidden_states)
+            else:
+                # Predict action
+                predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
@@ -678,6 +757,8 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    # 新增: 传递视觉模型实例参数
+    vision_model=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -724,6 +805,12 @@ def run_validation(
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                # 新增: 传递视觉模型实例参数
+                vision_model=vision_model,
+                use_vision_action_head=cfg.use_vision_action_head,
+                frozen_vision_model=cfg.frozen_vision_model,
+                # 新增：debug信息
+                debug=cfg.debug,
             )
 
             # Add the loss value to the metrics
@@ -787,10 +874,20 @@ def finetune(cfg: FinetuneConfig) -> None:
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
+    print(f"当前使用设备: {device_id}")
+    print(f"CUDA设备是否可用: {torch.cuda.is_available()}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("未检测到可用GPU，请检查CUDA配置")
+    print(f"当前设备名称: {torch.cuda.get_device_name(device_id) if torch.cuda.is_available() else 'CPU'}")
+    print(f"可用GPU数量: {torch.cuda.device_count()}")
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        wandb.init(
+            entity=cfg.wandb_entity, 
+            project=cfg.wandb_project, 
+            name=f"ft+{run_id}"
+        )
 
     # Print detected constants
     print(
@@ -854,6 +951,51 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
+    # 新增: 初始化视觉模型 (DINOv2) 并支持LoRA微调
+    vision_model = None
+    vision_dim = 768  # 默认特征维度，后续会根据实际模型更新
+    if cfg.use_vision_action_head:
+        print(f"Loading vision model: {cfg.vision_model_id}")
+        # 基础视觉模型加载
+        vision_model = timm.create_model(
+            cfg.vision_model_id,
+            pretrained=True,
+            num_classes=0,  # 不加载分类头
+            img_size=224,   # 输入图像尺寸
+        ).to(device_id, dtype=torch.bfloat16)
+
+        # 根据是否使用LoRA决定微调策略
+        if cfg.use_lora and not cfg.frozen_vision_model:
+            print(f"Applying LoRA to vision model with rank {cfg.lora_rank}")
+
+            # 配置LoRA参数
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=cfg.lora_rank * 2,
+                target_modules=["attn.qkv"],  # ViT模型的注意力模块
+                lora_dropout=cfg.lora_dropout,
+                bias="none",
+                task_type="FEATURE_EXTRACTION",
+            )
+
+            # 应用LoRA适配器
+            vision_model = get_peft_model(vision_model, lora_config)
+            vision_model.train()  # 启用训练模式（仅训练LoRA参数）
+            count_parameters(vision_model, "vision_model (LoRA)")  # 显示可训练参数数量
+        else:
+            # 不使用LoRA时冻结所有参数
+            for param in vision_model.parameters():
+                param.requires_grad = False
+            vision_model.eval()  # 推理模式
+            print("Vision model frozen (no LoRA)")
+
+        # 获取实际特征维度
+        if hasattr(vision_model, 'num_features'):
+            vision_dim = vision_model.num_features
+        elif hasattr(vision_model.base_model, 'num_features'):  # 处理LoRA包装后的模型
+            vision_dim = vision_model.base_model.num_features
+        print(f"Vision model output dimension: {vision_dim}")
+
     # FiLM setup
     if cfg.use_film:
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
@@ -870,9 +1012,28 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+        print("Using FiLM for better language following.")
+        # 提示： 如果同时使用FiLM和视觉-动作融合头，可能会导致冲突
+        if cfg.use_vision_action_head:
+            print("Warning: Using both FiLM and vision-action head. Ensure this is intended.")
+
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
+    # 新增： 是否使用视觉-动作融合头，并根据情况将视觉模型也进行DDP封装
+    # 检查是否有可训练参数
+    has_trainable_params = any(p.requires_grad for p in vision_model.parameters())
+    # print(f"Trainable params in vision_model: {sum(p.numel() for p in vision_model.parameters() if p.requires_grad)}")
+    
+    if cfg.use_vision_action_head and has_trainable_params:
+        # Wrap vision_model with DDP
+        print(f"Using vision-action head with vision model: {cfg.vision_model_id}")
+        assert vision_model is not None, "Vision model must be initialized when using vision-action head!"
+        count_parameters(vision_model, "vision_model (DDP wrap)")
+        vision_model = wrap_ddp(vision_model, device_id, find_unused=False)
+    else:
+        print("Not using vision-action head or vision model has no trainable parameters.")
+        print("Skipping vision_model's DDP wrap......")
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -886,14 +1047,30 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
-        action_head = init_module(
-            L1RegressionActionHead,
-            "action_head",
-            cfg,
-            device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16=True,
-        )
+        # 新增: 根据配置选择动作头类型
+        if cfg.use_vision_action_head:
+            action_head = init_module(
+                VisionActionHead,
+                "action_head",
+                cfg,
+                device_id,
+                {
+                    "input_dim": vla.module.llm_dim,
+                    "vision_dim": vision_model.module.num_features if isinstance(vision_model, DDP) else vision_model.num_features,
+                    "hidden_dim": vla.module.llm_dim,
+                    "action_dim": ACTION_DIM
+                },
+                to_bf16=True,
+            )
+        else:
+            action_head = init_module(
+                L1RegressionActionHead,
+                "action_head",
+                cfg,
+                device_id,
+                {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+                to_bf16=True,
+            )
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:
@@ -1050,6 +1227,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                # 新增: 传递视觉模型实例参数
+                vision_model=vision_model,
+                use_vision_action_head=cfg.use_vision_action_head,
+                frozen_vision_model=cfg.frozen_vision_model,
+                # 新增：debug信息
+                debug=cfg.debug,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1128,6 +1311,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    # 新增: 传递视觉模型实例参数
+                    vision_model=vision_model,
                 )
                 # Set model back to training mode after validation
                 vla.train()
