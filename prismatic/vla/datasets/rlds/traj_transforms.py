@@ -88,3 +88,135 @@ def add_pad_mask_dict(traj: Dict) -> Dict:
         traj[key]["pad_mask_dict"] = pad_mask_dict
 
     return traj
+
+
+def apply_random_observation_delay_v2(
+    traj: Dict,
+    delay_kwargs: Dict, # 配置随机延迟的参数，在 prismatic/vla/constants.py 中定义
+) -> Dict:
+    """
+    对 traj["observation"] 应用随机延迟，支持多种分布，并可选输出日志。
+    Args:
+        traj: 包含 "observation" 键的轨迹字典。
+        delay_kwargs: 控制延迟行为的参数字典，包含以下键：
+            - use_random_obs (bool): 是否启用随机延迟。
+            - max_delay_window (int): 最大延迟步数。
+            - random_seed (int): 随机种子，确保可复现。
+            - delay_distribution (str): 延迟分布类型，可选 "uniform", "deterministic", "trunc_normal", "exponential"。
+            - log_delay_info (bool): 是否打印延迟信息。
+            - 其他分布特定参数，如 "value"（deterministic），"mean" 和 "std"（trunc_normal），"lambda"（exponential）。
+    Returns:
+        应用随机延迟后的轨迹字典。
+    """
+    
+    use_random_obs = delay_kwargs.get("use_random_obs", False)
+    max_delay_window = delay_kwargs.get("max_delay_window", 0)
+    random_seed = delay_kwargs.get("random_seed", 42)
+    delay_distribution = delay_kwargs.get("delay_distribution", "uniform")
+    log_delay_info = delay_kwargs.get("log_delay_info", False)
+
+    # 设置全局随机种子，确保可复现（可能还需要设置 num_parallel_calls=1或None来保证完全复现）
+    tf.random.set_seed(random_seed)
+    if not use_random_obs or max_delay_window <= 0:
+        return traj
+
+    logging.info("=" * 88)
+    logging.info(f"Applying random observation delay with parameters: {delay_kwargs}")
+    logging.info("=" * 88)
+    
+    # 获取轨迹长度
+    obs = traj["observation"]
+    T = tf.shape(list(obs.values())[0])[0]
+
+    # ======================
+    # 日志：构建 info 字符串
+    # ======================
+    if log_delay_info:
+        # 基础信息
+        info_parts = [f"[Delay] max_delay_window={max_delay_window}, delay_distribution={delay_distribution}"]
+
+        # 根据分布类型，决定显示哪些参数
+        dist_params = {
+            "uniform": [],
+            "deterministic": ["value"],
+            "trunc_normal": ["mean", "std"],
+            "exponential": ["lambda_"]
+        }
+
+        param_keys = dist_params.get(delay_distribution, [])
+
+        for k in param_keys:
+            if k in delay_kwargs:
+                v = delay_kwargs[k]
+                if isinstance(v, float):
+                    info_parts.append(f"{k}={v:.3g}")
+                else:
+                    info_parts.append(f"{k}={v}")
+
+        # 添加控制类参数（可选）
+        if "use_random_obs" in delay_kwargs:
+            info_parts.append(f"use_obs={delay_kwargs['use_random_obs']}")
+
+        if "random_seed" in delay_kwargs:
+            info_parts.append(f"seed={delay_kwargs['random_seed']}")
+
+        info_str = " ".join(info_parts)
+        logging.info(f"[Random Delay Applied] {info_str}")
+
+    # ======================
+    # 延迟逻辑
+    # ======================
+    if delay_distribution == "deterministic":
+        delay_value = (delay_kwargs or {}).get("value", 0)
+        delay_value = min(delay_value, max_delay_window)
+        random_delays = tf.fill([T], delay_value)
+
+    else:
+        max_delays = tf.minimum(tf.range(T), max_delay_window)
+        n_candidates = max_delays + 1
+
+        if delay_distribution == "uniform":
+            random_normed = tf.random.uniform(tf.shape(max_delays), dtype=tf.float32)
+            random_delays = tf.cast(tf.floor(random_normed * tf.cast(n_candidates, tf.float32)), tf.int32)
+
+        elif delay_distribution == "trunc_normal":
+            kw = delay_kwargs or {}
+            mean = kw.get("mean", 0.0)
+            std = kw.get("std", 1.0)
+            z = tf.random.normal(tf.shape(max_delays), mean=mean, stddev=std, dtype=tf.float32)
+            z_clamped = tf.clip_by_value(z, 0.0, tf.cast(max_delays, tf.float32))
+            random_normed = z_clamped / tf.cast(n_candidates, tf.float32)
+            random_delays = tf.cast(tf.floor(random_normed * tf.cast(n_candidates, tf.float32)), tf.int32)
+
+        elif delay_distribution == "exponential":
+            kw = delay_kwargs or {}
+            lambd = kw.get("lambda", 1.0)
+            u = tf.random.uniform(tf.shape(max_delays), dtype=tf.float32)
+            exp_sample = -tf.math.log(1 - u) / lambd
+            exp_clamped = tf.minimum(exp_sample, tf.cast(max_delays, tf.float32))
+            random_normed = exp_clamped / tf.cast(n_candidates, tf.float32)
+            random_delays = tf.cast(tf.floor(random_normed * tf.cast(n_candidates, tf.float32)), tf.int32)
+
+        else:
+            raise ValueError(f"Unknown distribution: {delay_distribution}")
+
+    # 确保索引合法
+    gather_indices = tf.maximum(tf.range(T) - random_delays, 0)
+
+    # ======================
+    # 日志：打印采样的延迟值（可选）
+    # ======================
+    if log_delay_info:
+        # 打印前 20 个延迟值，避免输出太长
+        max_print = tf.minimum(T, 20)
+        delays_to_print = random_delays[:max_print]
+        logging.info(f"[Sampled Delays] {delays_to_print}")
+
+    # 应用延迟
+    traj["observation"] = tf.nest.map_structure(
+        lambda x: tf.gather(x, gather_indices),
+        obs
+    )
+
+    return traj
+

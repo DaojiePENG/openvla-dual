@@ -17,6 +17,7 @@ import tensorflow_datasets as tfds
 
 from prismatic.overwatch import initialize_overwatch
 from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+from prismatic.vla.constants import DELAY_KWARGS        # 新增： 配置随机延迟的参数
 from prismatic.vla.datasets.rlds import obs_transforms, traj_transforms
 from prismatic.vla.datasets.rlds.utils import goal_relabeling, task_augmentation
 from prismatic.vla.datasets.rlds.utils.data_utils import (
@@ -337,6 +338,13 @@ def apply_trajectory_transforms(
             future_action_window_size=future_action_window_size,
         ),
         num_parallel_calls,
+    )
+
+    dataset = dataset.traj_map(
+    partial(traj_transforms.apply_random_observation_delay_v2,
+            delay_kwargs = DELAY_KWARGS, # 配置随机延迟的参数，在 prismatic/vla/constants.py 中定义
+            ),       
+    num_parallel_calls
     )
 
     if train and subsample_length is not None:

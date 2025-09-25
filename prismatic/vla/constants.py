@@ -6,6 +6,8 @@ training or evaluation. If it is unclear, defaults to using the LIBERO simulatio
 """
 import sys
 from enum import Enum
+from dataclasses import dataclass, asdict
+from typing import Dict
 
 # Llama 2 token constants
 IGNORE_INDEX = -100
@@ -21,6 +23,26 @@ class NormalizationType(str, Enum):
     BOUNDS_Q99 = "bounds_q99"       # Normalize [quantile_01, ..., quantile_99] --> [-1, ..., 1]
     # fmt: on
 
+@dataclass
+class DelayKwargs():
+    """配置随机延迟的参数
+    """
+    use_random_obs: bool = True             # 是否使用随机延迟
+    max_delay_window: int = 20               # 最大延迟步数
+    random_seed: int = 42                   # 随机种子
+    delay_distribution: str = "uniform"     # 延迟分布类型
+    log_delay_info: bool = False            # 是否打印延迟信息
+
+    value: int = 0                          # 用于 deterministic
+    mean: float = 0.0                       # 用于 trunc_normal
+    std: float = 1.0                        # 用于 trunc_normal
+    lambda_: float = 1.0                    # 用于 exponential
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    def __call__(self) -> Dict:
+        return self.to_dict()
 
 # Define constants for each robot platform
 LIBERO_CONSTANTS = {
@@ -28,6 +50,7 @@ LIBERO_CONSTANTS = {
     "ACTION_DIM": 7,
     "PROPRIO_DIM": 8,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+    "DELAY_KWARGS": DelayKwargs().to_dict(),
 }
 
 ALOHA_CONSTANTS = {
@@ -35,6 +58,7 @@ ALOHA_CONSTANTS = {
     "ACTION_DIM": 14,
     "PROPRIO_DIM": 14,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS,
+    "DELAY_KWARGS": DelayKwargs().to_dict(),
 }
 
 BRIDGE_CONSTANTS = {
@@ -42,6 +66,7 @@ BRIDGE_CONSTANTS = {
     "ACTION_DIM": 7,
     "PROPRIO_DIM": 7,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+    "DELAY_KWARGS": DelayKwargs().to_dict(),
 }
 
 
@@ -76,6 +101,7 @@ NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
 ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
+DELAY_KWARGS = constants["DELAY_KWARGS"]
 
 # Print which robot platform constants are being used (for debugging)
 print(f"Using {ROBOT_PLATFORM} constants:")
@@ -83,4 +109,5 @@ print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
 print(f"  ACTION_DIM = {ACTION_DIM}")
 print(f"  PROPRIO_DIM = {PROPRIO_DIM}")
 print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
+print(f"  DELAY_KWARGS = {DELAY_KWARGS}")
 print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")
