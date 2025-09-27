@@ -341,7 +341,7 @@ def apply_trajectory_transforms(
     )
 
     dataset = dataset.traj_map(
-    partial(traj_transforms.apply_random_observation_delay_v2,
+    partial(traj_transforms.apply_random_observation_delay_v1,
             delay_kwargs = DELAY_KWARGS, # 配置随机延迟的参数，在 prismatic/vla/constants.py 中定义
             ),       
     num_parallel_calls

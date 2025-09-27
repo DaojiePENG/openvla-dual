@@ -158,3 +158,5 @@ wandb/
 
 # Local logs when running experiments
 /logs*
+/experiments/logs*
+train_ddp*

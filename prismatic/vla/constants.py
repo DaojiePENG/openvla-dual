@@ -129,7 +129,7 @@ ALL_CONSTANTS = {
 }
 
 # 将所有常量保存到.json文件
-def save_constants(dir):
+def save_constants(dir, all_constants=ALL_CONSTANTS):
     """
     将所有常量保存到指定目录的 constants.json 文件中。
 
@@ -144,6 +144,6 @@ def save_constants(dir):
     
     # 将常量字典写入 JSON 文件
     with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(ALL_CONSTANTS, f, indent=4, ensure_ascii=False)
+        json.dump(all_constants, f, indent=4, ensure_ascii=False)
     
     logging.info(f"Constants have been saved to: {file_path}")
