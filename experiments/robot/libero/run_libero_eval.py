@@ -12,12 +12,14 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict
 
 import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
+
+from prismatic.vla.constants import DELAY_KWARGS, save_constants
 
 import wandb
 
@@ -46,6 +48,8 @@ from experiments.robot.robot_utils import (
     invert_gripper_action,
     normalize_gripper_action,
     set_seed_everywhere,
+    apply_evaluation_obs_delay_v1, # 新增：导入评测观测延迟函数，与训练时使用的延迟函数实现类似但略有不同（apply_random_observation_delay_v1）
+    apply_evaluation_obs_delay_v2, # 新增：导入评测观测延迟函数，与训练时使用的延迟函数实现类似但略有不同（apply_random_observation_delay_v2）
 )
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
@@ -127,6 +131,13 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
+    #################################################################################################################
+    # 观测延迟参数
+    #################################################################################################################
+    use_eval_obs_delay: bool = True  # 是否在评测时启用观测延迟
+    # 如果需要覆盖constants中的DELAY_KWARGS，可添加自定义参数
+    eval_delay_kwargs: Optional[Dict] = None
+
     # fmt: on
 
 
@@ -141,6 +152,11 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    # 检验延时配置参数，如果没有，默认使用来自constants的配置
+    if cfg.use_eval_obs_delay and cfg.eval_delay_kwargs is None:
+        cfg.eval_delay_kwargs = DELAY_KWARGS
+        logging.warning(f'Using observation delay while the delay key args not defined, using default value from DELAY_KWARGS:\n {DELAY_KWARGS}')
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -204,6 +220,9 @@ def setup_logging(cfg: GenerateConfig):
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
+
+    # 保存constants参数
+    save_constants(os.path.join(cfg.local_log_dir, run_id + "constants"), cfg.eval_delay_kwargs)
 
     # Initialize Weights & Biases logging if enabled
     if cfg.use_wandb:
@@ -310,6 +329,9 @@ def run_episode(
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
+    # 新增：初始化延迟状态（用于跟踪历史观测）
+    delay_state = None
+
     # Run episode
     success = False
     try:
@@ -323,6 +345,15 @@ def run_episode(
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
             replay_images.append(img)
+
+            # 新增：应用评测观测延迟
+            if cfg.use_eval_obs_delay:
+                observation, delay_state = apply_evaluation_obs_delay_v1(
+                    observation=observation,
+                    timestep=t - cfg.num_steps_wait,  # 有效时间步（减去等待步骤）
+                    delay_kwargs=cfg.eval_delay_kwargs,
+                    delay_state=delay_state
+                )
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
