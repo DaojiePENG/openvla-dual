@@ -8,6 +8,9 @@ import sys
 from enum import Enum
 from dataclasses import dataclass, asdict
 from typing import Dict
+import json
+import os
+import logging
 
 # Llama 2 token constants
 IGNORE_INDEX = -100
@@ -111,3 +114,36 @@ print(f"  PROPRIO_DIM = {PROPRIO_DIM}")
 print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
 print(f"  DELAY_KWARGS = {DELAY_KWARGS}")
 print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")
+
+# 保存所有的常量到字典中，方便调试
+ALL_CONSTANTS = {
+    "ROBOT_PLATFORM": ROBOT_PLATFORM,
+    "NUM_ACTIONS_CHUNK": NUM_ACTIONS_CHUNK,
+    "ACTION_DIM": ACTION_DIM,
+    "PROPRIO_DIM": PROPRIO_DIM,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": ACTION_PROPRIO_NORMALIZATION_TYPE,
+    "IGNORE_INDEX": IGNORE_INDEX,
+    "ACTION_TOKEN_BEGIN_IDX": ACTION_TOKEN_BEGIN_IDX,
+    "STOP_INDEX": STOP_INDEX,
+    "DELAY_KWARGS": DELAY_KWARGS,
+}
+
+# 将所有常量保存到.json文件
+def save_constants(dir):
+    """
+    将所有常量保存到指定目录的 constants.json 文件中。
+
+    Args:
+        dir (str): 目标保存目录路径。
+    """
+    # 确保目标目录存在，如果不存在则创建
+    os.makedirs(dir, exist_ok=True)
+    
+    # 构建文件路径
+    file_path = os.path.join(dir, 'constants.json')
+    
+    # 将常量字典写入 JSON 文件
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(ALL_CONSTANTS, f, indent=4, ensure_ascii=False)
+    
+    logging.info(f"Constants have been saved to: {file_path}")

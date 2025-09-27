@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+import logging
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -58,6 +59,8 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
+    DELAY_KWARGS,
+    save_constants,
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
@@ -188,6 +191,8 @@ def get_run_id(cfg) -> str:
             run_id += "--vision_action_head"
         if cfg.frozen_vision_model:
             run_id += "--frozen_vision"
+        if DELAY_KWARGS.get("use_random_obs", False) and DELAY_KWARGS.get("max_delay_window", 0) > 0:
+            run_id += f"--random_delay-{DELAY_KWARGS['delay_distribution']}-mw{DELAY_KWARGS['max_delay_window']}-seed{DELAY_KWARGS['random_seed']}"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -874,12 +879,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
-    print(f"当前使用设备: {device_id}")
-    print(f"CUDA设备是否可用: {torch.cuda.is_available()}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("未检测到可用GPU，请检查CUDA配置")
-    print(f"当前设备名称: {torch.cuda.get_device_name(device_id) if torch.cuda.is_available() else 'CPU'}")
-    print(f"可用GPU数量: {torch.cuda.device_count()}")
+    logging.info(
+        f"当前使用设备: {device_id}\n"
+        f"CUDA设备是否可用: {torch.cuda.is_available()}\n"
+        f"当前设备名称: {torch.cuda.get_device_name(device_id)}\n"
+        f"可用GPU数量: {torch.cuda.device_count()}"
+    )
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
@@ -890,13 +895,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Print detected constants
-    print(
+    logging.info(
         "Detected constants:\n"
         f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
         f"\tACTION_DIM: {ACTION_DIM}\n"
         f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
-        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}\n"
+        f"\tDELAY_KWARGS: {DELAY_KWARGS}"
     )
+    save_constants(run_dir) # Save constants used for training
 
     # Two options:
     # (1) Base model is on Hugging Face Hub
@@ -955,7 +962,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     vision_model = None
     vision_dim = 768  # 默认特征维度，后续会根据实际模型更新
     if cfg.use_vision_action_head:
-        print(f"Loading vision model: {cfg.vision_model_id}")
+        logging.info(f"Loading vision model: {cfg.vision_model_id}")
         # 基础视觉模型加载
         vision_model = timm.create_model(
             cfg.vision_model_id,
@@ -966,7 +973,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
         # 根据是否使用LoRA决定微调策略
         if cfg.use_lora and not cfg.frozen_vision_model:
-            print(f"Applying LoRA to vision model with rank {cfg.lora_rank}")
+            logging.info(f"Applying LoRA to vision model with rank {cfg.lora_rank}")
 
             # 配置LoRA参数
             lora_config = LoraConfig(
@@ -987,14 +994,14 @@ def finetune(cfg: FinetuneConfig) -> None:
             for param in vision_model.parameters():
                 param.requires_grad = False
             vision_model.eval()  # 推理模式
-            print("Vision model frozen (no LoRA)")
+            logging.info("Vision model frozen (no LoRA)")
 
         # 获取实际特征维度
         if hasattr(vision_model, 'num_features'):
             vision_dim = vision_model.num_features
         elif hasattr(vision_model.base_model, 'num_features'):  # 处理LoRA包装后的模型
             vision_dim = vision_model.base_model.num_features
-        print(f"Vision model output dimension: {vision_dim}")
+        logging.info(f"Vision model output dimension: {vision_dim}")
 
     # FiLM setup
     if cfg.use_film:
@@ -1012,10 +1019,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
-        print("Using FiLM for better language following.")
+        logging.info("Using FiLM for better language following.")
         # 提示： 如果同时使用FiLM和视觉-动作融合头，可能会导致冲突
         if cfg.use_vision_action_head:
-            print("Warning: Using both FiLM and vision-action head. Ensure this is intended.")
+            logging.warning("Warning: Using both FiLM and vision-action head. Ensure this is intended.")
 
 
     # Wrap VLA with DDP
@@ -1023,17 +1030,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     # 新增： 是否使用视觉-动作融合头，并根据情况将视觉模型也进行DDP封装
     # 检查是否有可训练参数
     has_trainable_params = any(p.requires_grad for p in vision_model.parameters())
-    # print(f"Trainable params in vision_model: {sum(p.numel() for p in vision_model.parameters() if p.requires_grad)}")
     
     if cfg.use_vision_action_head and has_trainable_params:
         # Wrap vision_model with DDP
-        print(f"Using vision-action head with vision model: {cfg.vision_model_id}")
+        logging.info(f"Using vision-action head with vision model: {cfg.vision_model_id}")
         assert vision_model is not None, "Vision model must be initialized when using vision-action head!"
         count_parameters(vision_model, "vision_model (DDP wrap)")
         vision_model = wrap_ddp(vision_model, device_id, find_unused=False)
     else:
-        print("Not using vision-action head or vision model has no trainable parameters.")
-        print("Skipping vision_model's DDP wrap......")
+        logging.info("Not using vision-action head or vision model has no trainable parameters.\n"
+                     "Skipping vision_model's DDP wrap......")
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
