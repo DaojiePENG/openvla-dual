@@ -194,6 +194,12 @@ class PrismaticVisionBackbone(nn.Module):
             pixel_values (torch.Tensor): Pixels for input image(s), (B, C, H, W).
         """
         if self.num_images_in_input == 1:
+            # 【新增逻辑】根据通道维度确定图像数量（每张图像6通道：3+3）
+            total_channels = pixel_values.shape[1]
+            num_images = total_channels // 6  # 计算总图像数（6通道/张）
+            # 仅取第一张图像（前6通道）
+            pixel_values = pixel_values[:, :6, :, :]  # 形状: [bsz, 6, H, W]
+
             if not self.use_fused_vision_backbone:
                 return self.featurizer(pixel_values)
 

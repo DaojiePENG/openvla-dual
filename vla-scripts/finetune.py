@@ -354,7 +354,6 @@ def run_forward_pass(
 
     # 新增: 提取视觉特征，供视觉-动作融合头使用，仅在使用视觉-动作融合头且使用L1回归时进行
     vision_hidden_states = None
-    vision_hidden_states = None
     if use_vision_action_head and use_l1_regression and vision_model is not None:
         with torch.no_grad():  # 冻结视觉模型时使用no_grad
             # 1. 处理原始 pixel_values: [B, 12, H, W] (2张图 × 6通道/图)
@@ -364,14 +363,13 @@ def run_forward_pass(
 
             # 2. 按6通道拆分得到单张图（对应 self.get_num_images_in_input()=2 张图）
             # 每张图形状变为: [B, 6, H, W] (6通道: 3 for SigLIP + 3 for DINOv2)
-            # num_images = cfg.num_images_in_input
-            num_images = vla.module.vision_backbone.get_num_images_in_input()  # 获取输入图片数量（此处为2）
+            num_images = pixel_values.shape[1] // 6 # 自动根据通道数判断图片数量
             images = torch.split(pixel_values, [6] * num_images, dim=1)  # 按通道维度拆分，得到列表[图1, 图2]
             if debug:
                 print(f"拆分后单张图形状: {images[0].shape}")  # 预期: [1, 6, 224, 224]
 
             # 3. 选择目标图片（根据任务需求选第1张或第2张，此处以第0张为例）
-            target_image_idx = 0  # 0=第一张图，1=第二张图，可根据需求修改
+            target_image_idx = 1  # 0=第一张图（primary），1=第二张图（wrist），可根据需求修改
             target_image_6ch = images[target_image_idx]  # [B, 6, H, W]
 
             # 4. 从6通道中提取 DINOv2 专用的3通道（关键步骤！）
@@ -1147,7 +1145,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ---
 
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
-    use_wrist_image = cfg.num_images_in_input > 1
+    use_wrist_image = cfg.num_images_in_input > 1 or cfg.use_vision_action_head
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
