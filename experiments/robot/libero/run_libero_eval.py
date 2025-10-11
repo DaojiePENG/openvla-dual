@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union, Dict
@@ -141,6 +141,27 @@ class GenerateConfig:
     # fmt: on
 
 
+@dataclass
+class DelayKwargs():
+    """配置随机延迟的参数
+    """
+    use_random_obs: bool = True             # 是否使用随机延迟
+    max_delay_window: int = 20               # 最大延迟步数
+    random_seed: int = 42                   # 随机种子
+    delay_distribution: str = "uniform"     # 延迟分布类型
+    log_delay_info: bool = False            # 是否打印延迟信息
+
+    value: int = 0                          # 用于 deterministic
+    mean: float = 0.0                       # 用于 trunc_normal
+    std: float = 1.0                        # 用于 trunc_normal
+    lambda_: float = 1.0                    # 用于 exponential
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    def __call__(self) -> Dict:
+        return self.to_dict()
+
 def validate_config(cfg: GenerateConfig) -> None:
     """Validate configuration parameters."""
     assert cfg.pretrained_checkpoint is not None, "pretrained_checkpoint must not be None!"
@@ -222,6 +243,7 @@ def setup_logging(cfg: GenerateConfig):
     logger.info(f"Logging to local log file: {local_log_filepath}")
 
     # 保存constants参数
+    cfg.eval_delay_kwargs['use_eval_obs_delay'] = cfg.use_eval_obs_delay # 保存是否启用观测延迟的参数
     save_constants(os.path.join(cfg.local_log_dir, run_id + "constants"), cfg.eval_delay_kwargs)
 
     # Initialize Weights & Biases logging if enabled
@@ -492,6 +514,9 @@ def run_task(
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
+    # If using default initial states, set cfg.eval_delay_kwargs to None
+    cfg.eval_delay_kwargs = DelayKwargs().to_dict()
+
     # Validate configuration
     validate_config(cfg)
 

@@ -68,7 +68,7 @@ def get_aloha_wrist_images(obs):
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, notes=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{DATE}"
+    rollout_dir = f"./rollouts/{DATE_TIME}"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
     filetag = f"{rollout_dir}/{DATE_TIME}--openvla_oft--episode={idx}--success={success}--task={processed_task_description}"

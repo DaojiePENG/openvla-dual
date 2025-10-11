@@ -12,10 +12,12 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict
 
 import draccus
 import tqdm
+
+from prismatic.vla.constants import DELAY_KWARGS, save_constants
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append(".")
@@ -34,6 +36,8 @@ from experiments.robot.robot_utils import (
     DATE_TIME,
     get_image_resize_size,
     set_seed_everywhere,
+    apply_evaluation_obs_delay_v1,
+    apply_evaluation_obs_delay_v2,
 )
 
 # Set up logging
@@ -75,14 +79,47 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
+    #################################################################################################################
+    # 观测延迟参数
+    #################################################################################################################
+    use_eval_obs_delay: bool = True  # 是否在评测时启用观测延迟
+    # 如果需要覆盖constants中的DELAY_KWARGS，可添加自定义参数
+    eval_delay_kwargs: Optional[Dict] = None
+
     # fmt: on
 
+
+@dataclass
+class DelayKwargs():
+    """配置随机延迟的参数
+    """
+    use_random_obs: bool = True             # 是否使用随机延迟
+    max_delay_window: int = 20               # 最大延迟步数
+    random_seed: int = 42                   # 随机种子
+    delay_distribution: str = "uniform"     # 延迟分布类型
+    log_delay_info: bool = False            # 是否打印延迟信息
+
+    value: int = 0                          # 用于 deterministic
+    mean: float = 0.0                       # 用于 trunc_normal
+    std: float = 1.0                        # 用于 trunc_normal
+    lambda_: float = 1.0                    # 用于 exponential
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    def __call__(self) -> Dict:
+        return self.to_dict()
 
 def validate_config(cfg: GenerateConfig) -> None:
     """Validate configuration parameters."""
     assert cfg.use_vla_server, (
         "Must use VLA server (server-client interface) to query model and get actions! Please set --use_vla_server=True"
     )
+
+    # 检验延时配置参数，如果没有，默认使用来自constants的配置
+    if cfg.use_eval_obs_delay and cfg.eval_delay_kwargs is None:
+        cfg.eval_delay_kwargs = DELAY_KWARGS
+        logging.warning(f'Using observation delay while the delay key args not defined, using default value from DELAY_KWARGS:\n {DELAY_KWARGS}')
 
 
 def setup_logging(cfg: GenerateConfig):
@@ -97,6 +134,10 @@ def setup_logging(cfg: GenerateConfig):
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
+
+    # 保存constants参数
+    cfg.eval_delay_kwargs['use_eval_obs_delay'] = cfg.use_eval_obs_delay # 保存是否启用观测延迟的参数
+    save_constants(os.path.join(cfg.local_log_dir, run_id + "constants"), cfg.eval_delay_kwargs)
 
     return log_file, local_log_filepath, run_id
 
@@ -192,6 +233,16 @@ def run_episode(
             if len(action_queue) == 0:
                 # Prepare observation
                 observation, img_resized, left_wrist_resized, right_wrist_resized = prepare_observation(obs, resize_size)
+                
+                # 新增：应用评测观测延迟
+                if cfg.use_eval_obs_delay:
+                    observation, delay_state = apply_evaluation_obs_delay_v1(
+                        observation=observation,
+                        timestep=t,  # 有效时间步（减去等待步骤）
+                        delay_kwargs=cfg.eval_delay_kwargs,
+                        delay_state=delay_state
+                    )
+
                 observation["instruction"] = task_description
 
                 # Save processed images for replay
@@ -305,6 +356,9 @@ def save_episode_videos(
 @draccus.wrap()
 def eval_aloha(cfg: GenerateConfig) -> None:
     """Main function to evaluate a trained policy in a real-world ALOHA environment."""
+    # If using default initial states, set cfg.eval_delay_kwargs to None
+    cfg.eval_delay_kwargs = DelayKwargs().to_dict()
+
     # Validate configuration
     validate_config(cfg)
 
