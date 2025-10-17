@@ -294,4 +294,6 @@ class VisionActionHead(nn.Module):
         action_pred = self.fusion_head(fused_features)  # (batch_size, chunk_len, action_dim)
         
         return action_pred
+    def predict_action(self, actions_hidden_states, vision_hidden_states):
+        return self.forward(actions_hidden_states, vision_hidden_states)
     

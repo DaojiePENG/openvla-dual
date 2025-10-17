@@ -97,8 +97,8 @@ class GenerateConfig:
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
-    num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
-    use_proprio: bool = True                         # Whether to include proprio state in input
+    num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
+    use_proprio: bool = False                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
@@ -109,6 +109,9 @@ class GenerateConfig:
 
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
+
+    use_vision_action_head: bool = True             # 新增: 是否使用视觉-动作融合头
+    vision_model_id: str = "vit_large_patch14_dinov2.lvd142m"  # 新增: 视觉模型ID (DINOv2-L)
 
     #################################################################################################################
     # LIBERO environment-specific parameters
