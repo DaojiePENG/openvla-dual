@@ -21,7 +21,8 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict
+from dataclasses import dataclass, asdict
 
 import draccus
 import numpy as np
@@ -48,6 +49,8 @@ from experiments.robot.robot_utils import (
     invert_gripper_action,
     normalize_gripper_action,
     set_seed_everywhere,
+    apply_evaluation_obs_delay_v1, # 新增：导入评测观测延迟函数，与训练时使用的延迟函数实现类似但略有不同（apply_random_observation_delay_v1）
+    apply_evaluation_obs_delay_v2, # 新增：导入评测观测延迟函数，与训练时使用的延迟函数实现类似但略有不同（apply_random_observation_delay_v2）
 )
 
 
@@ -84,8 +87,36 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
+    #################################################################################################################
+    # 观测延迟参数
+    #################################################################################################################
+    use_eval_obs_delay: bool = True  # 是否在评测时启用观测延迟
+    # 如果需要覆盖constants中的DELAY_KWARGS，可添加自定义参数
+    eval_delay_kwargs: Optional[Dict] = None
+
     # fmt: on
 
+@dataclass
+class DelayKwargs():
+    """配置随机延迟的参数
+    """
+    use_random_obs: bool = True             # 是否使用随机延迟
+    max_delay_window: int = 20               # 最大延迟步数
+    random_seed: int = 42                   # 随机种子
+    delay_distribution: str = "uniform"     # 延迟分布类型
+    log_delay_info: bool = False            # 是否打印延迟信息
+
+    value: int = 0                          # 用于 deterministic
+    mean: float = 0.0                       # 用于 trunc_normal
+    std: float = 1.0                        # 用于 trunc_normal
+    lambda_: float = 1.0                    # 用于 exponential
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    def __call__(self) -> Dict:
+        return self.to_dict()
+    
 
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -140,6 +171,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
+
+    cfg.eval_delay_kwargs = DelayKwargs().to_dict() if cfg.eval_delay_kwargs is None else cfg.eval_delay_kwargs
+    print(f"Evaluation observation delay kwargs: {cfg.eval_delay_kwargs}")
+    log_file.write(f"Random key args: {cfg.eval_delay_kwargs}\n")
+
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
@@ -181,6 +217,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             elif cfg.task_suite_name == "libero_90":
                 max_steps = 400  # longest training demo has 373 steps
 
+            # 新增：初始化延迟状态（用于跟踪历史观测）
+            delay_state = None
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
             while t < max_steps + cfg.num_steps_wait:
@@ -206,6 +244,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
+
+                    # 新增：应用评测观测延迟
+                    if cfg.use_eval_obs_delay:
+                        observation, delay_state = apply_evaluation_obs_delay_v1(
+                            observation=observation,
+                            timestep=t - cfg.num_steps_wait,  # 有效时间步（减去等待步骤）
+                            delay_kwargs=cfg.eval_delay_kwargs,
+                            delay_state=delay_state
+                        )
 
                     # Query model to get action
                     action = get_action(

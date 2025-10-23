@@ -149,5 +149,9 @@ cache/
 data/
 
 # Rollout videos and wandb logs
-rollouts/
+rollouts*
 wandb/
+
+*.err
+*.out
+experiments/logs*
