@@ -49,6 +49,7 @@ from prismatic.training.train_utils import (
     compute_token_accuracy,
     get_current_action_mask,
     get_next_actions_mask,
+    compute_weighted_l1_loss,
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -101,6 +102,12 @@ class FinetuneConfig:
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
+    use_weighted_l1_loss: bool = True               # (When `use_l1_regression==True`) If True, uses weighted L1 loss for training
+    weight_strategy: str = "inverse"                 # (When `use_weighted_l1_loss==True`) Weighting strategy for weighted L1 loss
+    clip_max_weight: float = 10.0                    # (When `use_weighted_l1_loss==True`) Max weight clipping value for weighted L1 loss
+    epsilon: float = 1e-3                            # (When `use_weighted_l1_loss==True`) Small constant to avoid division by zero
+    alpha: float = 2.0                               # (When `use_weighted_l1_loss==True`) Exponential decay parameter
+    normalize_weights: bool = False                  # (When `use_weighted_l1_loss==True`) If True, normalizes weights to have mean 1 for each action chunk
 
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
@@ -267,6 +274,7 @@ def init_module(
 
 
 def run_forward_pass(
+    cfg: FinetuneConfig,
     vla,
     action_head,
     noisy_action_projector,
@@ -387,8 +395,19 @@ def run_forward_pass(
             # Predict action
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
-
+            if cfg.use_weighted_l1_loss:
+                loss = compute_weighted_l1_loss(
+                    ground_truth_actions, 
+                    predicted_actions,
+                    weight_strategy=cfg.weight_strategy,
+                    clip_max_weight=cfg.clip_max_weight,
+                    epsilon=cfg.epsilon,
+                    alpha=cfg.alpha,
+                    normalize_weights=cfg.normalize_weights,
+                )
+            else:
+                loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+        
         if use_diffusion:
             # Predict noise
             noise_pred = action_head.module.predict_noise(actions_hidden_states)
@@ -710,6 +729,7 @@ def run_validation(
         for batch in val_dataloader:
             # Always compute L1 loss for validation, even for diffusion
             _, metrics = run_forward_pass(
+                cfg=cfg,
                 vla=vla,
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector,
@@ -1036,6 +1056,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
+                cfg=cfg,
                 vla=vla,
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,

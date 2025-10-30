@@ -149,5 +149,15 @@ cache/
 data/
 
 # Rollout videos and wandb logs
-rollouts/
-wandb/
+rollouts*/
+wandb*/
+
+# fintune development versions and running scripts
+/vla-scripts/finetune_e*.py
+/vla-scripts/*finetune*.sh
+
+# Local logs when running experiments
+/logs*
+/experiments/logs*
+*.err
+*.out
