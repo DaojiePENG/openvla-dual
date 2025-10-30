@@ -296,4 +296,107 @@ class VisionActionHead(nn.Module):
         return action_pred
     def predict_action(self, actions_hidden_states, vision_hidden_states):
         return self.forward(actions_hidden_states, vision_hidden_states)
-    
+
+class VisionActionHead_V2(nn.Module):
+    """
+    MLP-based action head that fuses vision hidden states and action hidden states for continuous action prediction.
+    """
+    def __init__(
+        self,
+        input_dim=4096,          # 大模型骨架输出的维度
+        vision_dim=1024,         # 修正为DINOv2-L的实际输出维度（1024）
+        hidden_dim=4096,
+        action_dim=7,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_actions_chunk = NUM_ACTIONS_CHUNK  # 从constants导入
+        
+        # 视觉特征处理分支（输入维度修正为1024）
+        self.vision_proj = nn.Sequential(
+            nn.Linear(vision_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # 动作特征处理分支
+        self.action_proj = nn.Sequential(
+            nn.Linear(input_dim * ACTION_DIM, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # 融合后的预测头
+        self.fusion_head = MLPResNet(
+            num_blocks=2,
+            input_dim=hidden_dim * 3,  # 融合视觉*2和动作特征
+            hidden_dim=hidden_dim,
+            output_dim=action_dim
+        )
+
+    def forward(self, actions_hidden_states, vision_hidden_states, vision_hidden_states_v2):
+        """
+        Args:
+            actions_hidden_states: 大模型输出的动作相关隐藏状态 
+                shape: (batch_size, chunk_len * action_dim, input_dim)
+            vision_hidden_states: 视觉模型输出的隐藏状态，手腕视图特征输入
+                shape: (batch_size, vision_seq_len, vision_dim) -> 例如(1, 151, 1024)
+            vision_hidden_states_v2: 视觉模型输出的隐藏状态（版本2），主视图特征输入
+                shape: (batch_size, vision_seq_len, vision_dim) -> 例如(1, 151, 1024)
+        Returns:
+            预测的连续动作 shape: (batch_size, chunk_len, action_dim)
+        """
+        batch_size = actions_hidden_states.shape[0]
+        
+        # 处理动作特征
+        rearranged_actions = actions_hidden_states.reshape(
+            batch_size, self.num_actions_chunk, -1  # (batch_size, chunk_len, input_dim*ACTION_DIM)
+        )
+        action_features = self.action_proj(rearranged_actions)  # (batch_size, chunk_len, hidden_dim)
+        
+        # 处理视觉特征（关键修正）
+        # 1. 确保视觉特征维度正确（排除异常情况）
+        if vision_hidden_states.dim() != 3:
+            # 紧急修复：当视觉特征维度异常时，强制reshape（适用于单样本情况）
+            vision_hidden_states = vision_hidden_states.view(batch_size, -1, self.vision_proj[0].in_features)
+        
+        # 2. 提取DINOv2的分类token（通常是第一个token，比全局平均更有效）
+        vision_global = vision_hidden_states[:, 0, :]  # (batch_size, 1024)
+        # 如果分类token无效，使用全局平均作为备选
+        # vision_global = torch.mean(vision_hidden_states, dim=1)  # (batch_size, 1024)
+        
+        # 3. 视觉特征投影
+        vision_features = self.vision_proj(vision_global)  # (batch_size, hidden_dim)
+        
+        # 4. 扩展到与动作序列长度匹配
+        vision_features = vision_features.unsqueeze(1).repeat(
+            1, self.num_actions_chunk, 1  # (batch_size, chunk_len, hidden_dim)
+        )
+
+        # -----------------------处理第二组主视图的视觉特征----------------------------
+        # 处理视觉特征（关键修正）
+        # 1. 确保视觉特征维度正确（排除异常情况）
+        if vision_hidden_states_v2.dim() != 3:
+            # 紧急修复：当视觉特征维度异常时，强制reshape（适用于单样本情况）
+            vision_hidden_states_v2 = vision_hidden_states_v2.view(batch_size, -1, self.vision_proj[0].in_features)
+
+        # 2. 提取DINOv2的分类token（通常是第一个token，比全局平均更有效）
+        vision_global_v2 = vision_hidden_states_v2[:, 0, :]  # (batch_size, 1024)
+        # 如果分类token无效，使用全局平均作为备选
+        # vision_global = torch.mean(vision_hidden_states, dim=1)  # (batch_size, 1024)
+        
+        # 3. 视觉特征投影
+        vision_features_v2 = self.vision_proj(vision_global_v2)  # (batch_size, hidden_dim)
+        
+        # 4. 扩展到与动作序列长度匹配
+        vision_features_v2 = vision_features_v2.unsqueeze(1).repeat(
+            1, self.num_actions_chunk, 1  # (batch_size, chunk_len, hidden_dim)
+        )
+        
+        # 融合特征并预测动作
+        fused_features = torch.cat([action_features, vision_features, vision_features_v2], dim=-1)  # (batch_size, chunk_len, 3*hidden_dim)
+        action_pred = self.fusion_head(fused_features)  # (batch_size, chunk_len, action_dim)
+        
+        return action_pred
+    def predict_action(self, actions_hidden_states, vision_hidden_states, vision_hidden_states_v2):
+        return self.forward(actions_hidden_states, vision_hidden_states, vision_hidden_states_v2)

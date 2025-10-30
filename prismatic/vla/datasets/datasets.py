@@ -37,6 +37,7 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        img_v2 = Image.fromarray(rlds_batch["observation_real"]["image_primary"][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -67,13 +68,14 @@ class RLDSBatchTransform:
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
+        pixel_values_v2 = self.image_transform(img_v2)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(pixel_values=pixel_values, pixel_values_v2=pixel_values_v2, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
         # Add additional inputs
         if self.use_wrist_image:
@@ -84,9 +86,19 @@ class RLDSBatchTransform:
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+            all_wrist_pixels_v2 = []
+            for k in rlds_batch["observation_real"].keys():
+                if "wrist" in k:
+                    img_wrist = Image.fromarray(rlds_batch["observation_real"][k][0])
+                    pixel_values_wrist = self.image_transform(img_wrist)
+                    all_wrist_pixels_v2.append(pixel_values_wrist)
+            return_dict["pixel_values_wrist_v2"] = torch.cat(all_wrist_pixels_v2, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
+
+            proprio_v2 = rlds_batch["observation_real"]["proprio"]
+            return_dict["proprio_v2"] = proprio_v2
 
         return return_dict
 

@@ -341,7 +341,7 @@ def apply_trajectory_transforms(
     )
 
     dataset = dataset.traj_map(
-    partial(traj_transforms.apply_random_observation_delay_v1,
+    partial(traj_transforms.apply_random_observation_delay_v2,
             delay_kwargs = DELAY_KWARGS, # 配置随机延迟的参数，在 prismatic/vla/constants.py 中定义
             ),       
     num_parallel_calls
@@ -406,6 +406,9 @@ def apply_frame_transforms(
     def apply_obs_transform(fn: Callable[[Dict], Dict], frame: Dict) -> Dict:
         frame["task"] = fn(frame["task"])
         frame["observation"] = dl.vmap(fn)(frame["observation"])
+        # 仅在存在时处理 observation_real
+        if "observation_real" in frame:
+            frame["observation_real"] = dl.vmap(fn)(frame["observation_real"])
         return frame
 
     # Decode + resize images (and depth images)

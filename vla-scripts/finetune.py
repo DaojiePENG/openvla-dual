@@ -40,6 +40,7 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.action_heads import VisionActionHead # 新增：视觉-动作融合头
+from prismatic.models.action_heads import VisionActionHead_V2 # 新增：视觉-动作融合头
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -356,31 +357,42 @@ def run_forward_pass(
     vision_hidden_states = None
     if use_vision_action_head and use_l1_regression and vision_model is not None:
         with torch.no_grad():  # 冻结视觉模型时使用no_grad
-            # 1. 处理原始 pixel_values: [B, 12, H, W] (2张图 × 6通道/图)
-            pixel_values = batch["pixel_values"].to(device_id, dtype=torch.bfloat16)
+            # 1. 处理原始实时的图像 pixel_values_v2: [B, 12, H, W] (2张图 × 6通道/图)
+            pixel_values_v2 = batch["pixel_values_v2"].to(device_id, dtype=torch.bfloat16)
             if debug:
-                print(f"原始 pixel_values 形状: {pixel_values.shape}")  # 预期: [1, 12, 224, 224]
+                print(f"原始 pixel_values_v2 形状: {pixel_values_v2.shape}")  # 预期: [1, 12, 224, 224]
 
             # 2. 按6通道拆分得到单张图（对应 self.get_num_images_in_input()=2 张图）
             # 每张图形状变为: [B, 6, H, W] (6通道: 3 for SigLIP + 3 for DINOv2)
-            num_images = pixel_values.shape[1] // 6 # 自动根据通道数判断图片数量
-            images = torch.split(pixel_values, [6] * num_images, dim=1)  # 按通道维度拆分，得到列表[图1, 图2]
+            num_images = pixel_values_v2.shape[1] // 6 # 自动根据通道数判断图片数量
+            images = torch.split(pixel_values_v2, [6] * num_images, dim=1)  # 按通道维度拆分，得到列表[图1, 图2]
             if debug:
                 print(f"拆分后单张图形状: {images[0].shape}")  # 预期: [1, 6, 224, 224]
 
             # 3. 选择目标图片（根据任务需求选第1张或第2张，此处以第0张为例）
             target_image_idx = 1  # 0=第一张图（primary），1=第二张图（wrist），可根据需求修改
             target_image_6ch = images[target_image_idx]  # [B, 6, H, W]
+            # 3.2 选择主视图目标图片
+            target_image_idx = 0  # 0=第一张图（primary），1=第二张图（wrist），可根据需求修改
+            target_image_6ch_v2 = images[target_image_idx]  # [B, 6, H, W]
 
             # 4. 从6通道中提取 DINOv2 专用的3通道（关键步骤！）
             # 假设通道分配：前3通道=SigLIP，后3通道=DINOv2（若实际相反，改为[:, :3, :, :]）
             dino2_image_3ch = target_image_6ch[:, 3:, :, :]  # [B, 3, H, W]，取后3通道给DINOv2
             if debug:
                 print(f"DINOv2 输入形状: {dino2_image_3ch.shape}")  # 预期: [1, 3, 224, 224]
+            # 4.2 从6通道中提取 DINOv2 专用的3通道（关键步骤！）
+            # 假设通道分配：前3通道=SigLIP，后3通道=DINOv2（若实际相反，改为[:, :3, :, :]）
+            dino2_image_3ch_v2 = target_image_6ch_v2[:, 3:, :, :]  # [B, 3, H, W]，取后3通道给DINOv2
+            if debug:
+                print(f"DINOv2 输入形状: {dino2_image_3ch_v2.shape}")  # 预期: [1, 3, 224, 224]
 
             # 5. 校验通道数，确保符合视觉模型要求
             if dino2_image_3ch.shape[1] != 3:
                 raise ValueError(f"DINOv2 需3通道输入，实际得到 {dino2_image_3ch.shape[1]} 通道")
+            # 5.2 校验通道数，确保符合视觉模型要求
+            if dino2_image_3ch_v2.shape[1] != 3:
+                raise ValueError(f"DINOv2 需3通道输入，实际得到 {dino2_image_3ch_v2.shape[1]} 通道")
 
             # 6. 视觉模型前向传播，输出特征
             # vision_hidden_states = vision_model.module(dino2_image_3ch)  # 输出形状: [B, seq_len, 1024]
@@ -391,14 +403,19 @@ def run_forward_pass(
                 if hasattr(inner_model, 'base_model'):
                     # 如果是LoRA模型，使用base_model.forward获取特征
                     vision_hidden_states = inner_model.base_model(dino2_image_3ch)
+                    vision_hidden_states_v2 = inner_model.base_model(dino2_image_3ch_v2)
                 else:
                     # 非LoRA模型，直接调用内部模型
                     vision_hidden_states = inner_model(dino2_image_3ch)
+                    vision_hidden_states_v2 = inner_model(dino2_image_3ch_v2)
             else:
                 # 未使用DDP的情况
                 vision_hidden_states = vision_model(dino2_image_3ch)
+                vision_hidden_states_v2 = vision_model(dino2_image_3ch_v2)
             if debug:
                 print(f"视觉模型输出形状: {vision_hidden_states.shape}")  # 预期: [1, 151, 1024]（DINOv2-L特征）
+            if debug:
+                print(f"视觉模型输出形状: {vision_hidden_states_v2.shape}")  # 预期: [1, 151, 1024]（DINOv2-L特征）
 
 
     # VLA forward pass
@@ -464,7 +481,7 @@ def run_forward_pass(
         if use_l1_regression:
             # 新增： 根据是否使用视觉动作头选择不同的预测方式
             if use_vision_action_head:
-                predicted_actions = action_head.module(actions_hidden_states, vision_hidden_states)
+                predicted_actions = action_head.module(actions_hidden_states, vision_hidden_states, vision_hidden_states_v2)
             else:
                 # Predict action
                 predicted_actions = action_head.module.predict_action(actions_hidden_states)
@@ -723,13 +740,13 @@ def save_training_checkpoint(
                     os.makedirs(merged_dir, exist_ok=True)
                     if hasattr(vm, "save_pretrained"):
                         vm.save_pretrained(merged_dir)
-                        logging.infologging.info(f"Saved merged vision_model at: {merged_dir}")
+                        logging.info(f"Saved merged vision_model at: {merged_dir}")
                     elif hasattr(vm, "base_model") and hasattr(vm.base_model, "save_pretrained"):
                         vm.base_model.save_pretrained(merged_dir)
-                        logging.infologging.info(f"Saved merged vision_model.base_model at: {merged_dir}")
+                        logging.info(f"Saved merged vision_model.base_model at: {merged_dir}")
                     else:
                         torch.save(vm.state_dict(), merged_dir / f"vision_model_state_dict--{checkpoint_name_suffix}")
-                        logging.infologging.info(f"Saved merged vision_model state_dict at: {merged_dir}")
+                        logging.info(f"Saved merged vision_model state_dict at: {merged_dir}")
 
                 # Save adapter (preferred) or fallback to state_dict
                 if hasattr(vm, "save_pretrained"):
@@ -1091,7 +1108,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         # 新增: 根据配置选择动作头类型
         if cfg.use_vision_action_head:
             action_head = init_module(
-                VisionActionHead,
+                VisionActionHead_V2,
                 "action_head",
                 cfg,
                 device_id,

@@ -328,6 +328,12 @@ def apply_random_observation_delay_v2(
         max_print = tf.minimum(T, 20)
         delays_to_print = random_delays[:max_print]
         logging.info(f"[Sampled Delays] {delays_to_print}")
+    
+    # 将原始的observation保存为：'observation_real'
+    traj["observation_real"] = tf.nest.map_structure(
+        lambda x: x,  # 不进行延迟，直接保留原始数据
+        obs  # 原始 observation 数据
+    )
 
     # 应用延迟
     traj["observation"] = tf.nest.map_structure(

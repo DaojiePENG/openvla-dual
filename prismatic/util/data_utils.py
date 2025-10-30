@@ -102,6 +102,9 @@ class PaddedCollatorForActionPrediction:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        # 处理 pixel_values_v2（如果存在）
+        has_pixel_v2 = "pixel_values_v2" in instances[0]
+        pixel_values_v2 = [instance["pixel_values_v2"] for instance in instances] if has_pixel_v2 else None
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -132,6 +135,19 @@ class PaddedCollatorForActionPrediction:
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
+        # 处理 pixel_values_v2（与 pixel_values 保持一致的堆叠逻辑）
+        if has_pixel_v2:
+            assert all([pv is not None for pv in pixel_values_v2]), "Invalid Example with `pixel_values_v2 = None`!"
+            if isinstance(pixel_values_v2[0], torch.Tensor):
+                # 若存在对应的 wrist 图像，同样拼接（根据实际需求调整）
+                if "pixel_values_wrist_v2" in instances[0]:
+                    pixel_values_wrist_v2 = [instance["pixel_values_wrist_v2"] for instance in instances]
+                    pixel_values_v2 = torch.cat((torch.stack(pixel_values_v2), torch.stack(pixel_values_wrist_v2)), dim=1)
+                else:
+                    pixel_values_v2 = torch.stack(pixel_values_v2)
+            else:
+               raise ValueError(f"Unsupported `pixel_values_v2` type = {type(pixel_values_v2)}")
+
         # Stack all actions
         actions = [torch.from_numpy(np.copy(instance["actions"])) for instance in instances]
         actions = torch.stack(actions)
@@ -151,6 +167,11 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
         )
+
+        # 仅当存在时添加 pixel_values_v2 到输出
+        if has_pixel_v2:
+           output["pixel_values_v2"] = pixel_values_v2
+
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output
