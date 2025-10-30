@@ -189,10 +189,10 @@ def get_run_id(cfg) -> str:
         # 新增: 添加视觉动作头标识
         if cfg.use_vision_action_head:
             run_id += "--vision_action_head"
-        if cfg.frozen_vision_model:
-            run_id += "--frozen_vision"
-        if DELAY_KWARGS.get("use_random_obs", False) and DELAY_KWARGS.get("max_delay_window", 0) > 0:
-            run_id += f"--random_delay-{DELAY_KWARGS['delay_distribution']}-mw{DELAY_KWARGS['max_delay_window']}-seed{DELAY_KWARGS['random_seed']}"
+        # if cfg.frozen_vision_model:
+        #     run_id += "--frozen_vision"
+        # if DELAY_KWARGS.get("use_random_obs", False) and DELAY_KWARGS.get("max_delay_window", 0) > 0:
+        #     run_id += f"--random_delay-{DELAY_KWARGS['delay_distribution']}-mw{DELAY_KWARGS['max_delay_window']}-seed{DELAY_KWARGS['random_seed']}"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -662,6 +662,7 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    vision_model,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -698,7 +699,7 @@ def save_training_checkpoint(
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
         save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
-        print(f"Saving Model Checkpoint for Step {log_step}")
+        logging.info(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
     dist.barrier()
@@ -708,6 +709,40 @@ def save_training_checkpoint(
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
+
+        # Save vision_model LoRA adapter (if present) to a separate folder named "lora_adapter" + "vision_model"
+        vision_adapter_dir = checkpoint_dir / ("lora_adapter" + "_vision_model")
+        if distributed_state.is_main_process and vision_model is not None:
+            os.makedirs(vision_adapter_dir, exist_ok=True)
+            # Unwrap DDP if necessary
+            vm = vision_model.module if isinstance(vision_model, DDP) else vision_model
+            try:
+                # If configured to merge LoRA during training, also save the full vision_model
+                if cfg.merge_lora_during_training:
+                    merged_dir = checkpoint_dir / "vision_model_merged"
+                    os.makedirs(merged_dir, exist_ok=True)
+                    if hasattr(vm, "save_pretrained"):
+                        vm.save_pretrained(merged_dir)
+                        logging.infologging.info(f"Saved merged vision_model at: {merged_dir}")
+                    elif hasattr(vm, "base_model") and hasattr(vm.base_model, "save_pretrained"):
+                        vm.base_model.save_pretrained(merged_dir)
+                        logging.infologging.info(f"Saved merged vision_model.base_model at: {merged_dir}")
+                    else:
+                        torch.save(vm.state_dict(), merged_dir / f"vision_model_state_dict--{checkpoint_name_suffix}")
+                        logging.infologging.info(f"Saved merged vision_model state_dict at: {merged_dir}")
+
+                # Save adapter (preferred) or fallback to state_dict
+                if hasattr(vm, "save_pretrained"):
+                    vm.save_pretrained(vision_adapter_dir)
+                    logging.info(f"Saved vision_model adapter at: {vision_adapter_dir}")
+                elif hasattr(vm, "base_model") and hasattr(vm.base_model, "save_pretrained"):
+                    vm.base_model.save_pretrained(vision_adapter_dir)
+                    logging.info(f"Saved vision_model.base_model adapter at: {vision_adapter_dir}")
+                else:
+                    torch.save(vm.state_dict(), vision_adapter_dir / f"vision_model_state_dict--{checkpoint_name_suffix}")
+                    logging.info(f"Saved vision_model state_dict at: {vision_adapter_dir}")
+            except Exception as e:
+                logging.warning(f"Warning: failed to save vision_model adapter: {e}")
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -1027,7 +1062,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     vla = wrap_ddp(vla, device_id, find_unused=True)
     # 新增： 是否使用视觉-动作融合头，并根据情况将视觉模型也进行DDP封装
     # 检查是否有可训练参数
-    has_trainable_params = any(p.requires_grad for p in vision_model.parameters())
+    has_trainable_params = False
+    if cfg.use_vision_action_head and vision_model is not None:
+        has_trainable_params = any(p.requires_grad for p in vision_model.parameters())
     
     if cfg.use_vision_action_head and has_trainable_params:
         # Wrap vision_model with DDP
@@ -1296,6 +1333,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    vision_model=vision_model if cfg.use_vision_action_head else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
