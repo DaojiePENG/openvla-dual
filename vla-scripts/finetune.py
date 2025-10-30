@@ -40,7 +40,7 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.action_heads import VisionActionHead # 新增：视觉-动作融合头
-from prismatic.models.action_heads import VisionActionHead_V2 # 新增：视觉-动作融合头
+from prismatic.models.action_heads import VisionActionHead_V2, VisionActionHead_E2 # 新增：视觉-动作融合头
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -395,27 +395,26 @@ def run_forward_pass(
                 raise ValueError(f"DINOv2 需3通道输入，实际得到 {dino2_image_3ch_v2.shape[1]} 通道")
 
             # 6. 视觉模型前向传播，输出特征
-            # vision_hidden_states = vision_model.module(dino2_image_3ch)  # 输出形状: [B, seq_len, 1024]
             # 适配DDP和LoRA包装的情况
             if isinstance(vision_model, DDP):
-                # 先获取DDP包装的内部模型（可能是PeftModel或原始模型）
                 inner_model = vision_model.module
-                if hasattr(inner_model, 'base_model'):
-                    # 如果是LoRA模型，使用base_model.forward获取特征
-                    vision_hidden_states = inner_model.base_model(dino2_image_3ch)
-                    vision_hidden_states_v2 = inner_model.base_model(dino2_image_3ch_v2)
-                else:
-                    # 非LoRA模型，直接调用内部模型
-                    vision_hidden_states = inner_model(dino2_image_3ch)
-                    vision_hidden_states_v2 = inner_model(dino2_image_3ch_v2)
             else:
-                # 未使用DDP的情况
-                vision_hidden_states = vision_model(dino2_image_3ch)
-                vision_hidden_states_v2 = vision_model(dino2_image_3ch_v2)
-            if debug:
-                print(f"视觉模型输出形状: {vision_hidden_states.shape}")  # 预期: [1, 151, 1024]（DINOv2-L特征）
-            if debug:
-                print(f"视觉模型输出形状: {vision_hidden_states_v2.shape}")  # 预期: [1, 151, 1024]（DINOv2-L特征）
+                inner_model = vision_model
+            # 处理 LoRA 包装：获取 base_model
+            if hasattr(inner_model, 'base_model'):
+                base_model = inner_model.base_model  # PeftModel -> base_model (DINOv2)
+            else:
+                base_model = inner_model
+            # ✅ 关键：使用 get_intermediate_layers 获取完整 token 序列
+            # 注意：DINOv2 推荐使用最后一层或中间层的输出
+            with torch.no_grad():
+                # 方法1: 获取最后一层的完整输出序列 [B, N+1, D]
+                # 适用于 HuggingFace 版 DINOv2 (如 facebook/dinov2-base-imagenet1k)
+                # vision_hidden_states = base_model.get_intermediate_layers(dino2_image_3ch, n=1)[0]
+                # vision_hidden_states_v2 = base_model.get_intermediate_layers(dino2_image_3ch_v2, n=1)[0]
+                # 或者方法2: 如果有 forward_features 方法（timm 风格）
+                vision_hidden_states = base_model.forward_features(dino2_image_3ch)
+                vision_hidden_states_v2 = base_model.forward_features(dino2_image_3ch_v2)
 
 
     # VLA forward pass
@@ -1108,7 +1107,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         # 新增: 根据配置选择动作头类型
         if cfg.use_vision_action_head:
             action_head = init_module(
-                VisionActionHead_V2,
+                VisionActionHead_E2,
                 "action_head",
                 cfg,
                 device_id,

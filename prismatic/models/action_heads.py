@@ -400,3 +400,187 @@ class VisionActionHead_V2(nn.Module):
         return action_pred
     def predict_action(self, actions_hidden_states, vision_hidden_states, vision_hidden_states_v2):
         return self.forward(actions_hidden_states, vision_hidden_states, vision_hidden_states_v2)
+
+
+class VisionActionHead_E1(nn.Module):
+    def __init__(
+        self,
+        input_dim=4096,          # 大模型骨架输出的维度
+        vision_dim=1024,         # DINOv2-L输出维度
+        hidden_dim=4096,
+        action_dim=7,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_actions_chunk = NUM_ACTIONS_CHUNK  # 动作序列长度（如5）
+        self.vision_dim = vision_dim  # 新增：保存视觉特征维度，用于后续校验
+        
+        # 视觉特征处理分支
+        self.vision_proj = MLPResNet(
+            num_blocks=2,
+            input_dim=vision_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim
+        )
+        
+        # 动作特征处理分支 
+        self.action_proj = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim
+        )
+        
+        # 融合后的预测头（保持不变）
+        self.fusion_head = MLPResNet(
+            num_blocks=2,
+            input_dim=hidden_dim * 2,  # 融合视觉和动作特征
+            hidden_dim=hidden_dim,
+            output_dim=action_dim
+        )
+
+    def forward(self, actions_hidden_states, vision_hidden_states):
+        batch_size = actions_hidden_states.shape[0]
+        vision_seq_len = vision_hidden_states.shape[1]  # 视觉token数量（如DINOv2的151）
+        
+        # 处理动作特征（保持不变）
+        rearranged_actions = actions_hidden_states.reshape(
+            batch_size, self.num_actions_chunk, -1  # (batch_size, chunk_len, input_dim*ACTION_DIM)
+        )
+        action_features = self.action_proj(rearranged_actions)  # (batch_size, chunk_len, hidden_dim)
+        
+        # 处理视觉特征（核心修改）
+        # 1. 校验视觉特征维度
+        if vision_hidden_states.dim() != 3:
+            vision_hidden_states = vision_hidden_states.view(batch_size, -1, self.vision_dim)
+        
+        # 2. 选取与动作序列长度匹配的视觉token
+        if vision_seq_len >= self.num_actions_chunk:
+            # 策略：跳过[CLS] token，取后续有空间意义的token（更适合机器人任务）
+            # 若视觉token充足，取前num_actions_chunk个非分类token
+            selected_vision_tokens = vision_hidden_states[:, 1 : 1 + self.num_actions_chunk, :]  # (B, chunk_len, vision_dim)
+        else:
+            # 策略：若视觉token不足，重复最后一个token补齐（避免维度不匹配）
+            pad_length = self.num_actions_chunk - vision_seq_len
+            selected_vision_tokens = torch.cat([
+                vision_hidden_states,  # 取全部视觉token
+                vision_hidden_states[:, -1:, :].repeat(1, pad_length, 1)  # 补齐
+            ], dim=1)
+        
+        # 3. 视觉特征投影（每个token单独投影，替代原全局投影）
+        vision_features = self.vision_proj(selected_vision_tokens)  # (B, chunk_len, hidden_dim)
+        # （无需再扩展维度，已与动作序列长度一致）
+        
+        # 融合特征并预测动作（保持不变）
+        fused_features = torch.cat([action_features, vision_features], dim=-1)  # (B, chunk_len, 2*hidden_dim)
+        action_pred = self.fusion_head(fused_features)  # (B, chunk_len, action_dim)
+        
+        return action_pred
+
+    def predict_action(self, actions_hidden_states, vision_hidden_states):
+        return self.forward(actions_hidden_states, vision_hidden_states)
+    
+
+class VisionActionHead_E2(nn.Module):
+    def __init__(
+        self,
+        input_dim=4096,          # 大模型骨架输出的维度
+        vision_dim=1024,         # DINOv2-L输出维度
+        hidden_dim=4096,
+        action_dim=7,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_actions_chunk = NUM_ACTIONS_CHUNK  # 动作序列长度（如5）
+        self.vision_dim = vision_dim  # 新增：保存视觉特征维度，用于后续校验
+        
+        # 视觉特征处理分支
+        self.vision_proj = MLPResNet(
+            num_blocks=2,
+            input_dim=vision_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim
+        )
+        
+        # 动作特征处理分支 
+        self.action_proj = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim
+        )
+        
+        # 融合后的预测头（保持不变）
+        self.fusion_head = MLPResNet(
+            num_blocks=2,
+            input_dim=hidden_dim * 3,  # 融合视觉和动作特征
+            hidden_dim=hidden_dim,
+            output_dim=action_dim
+        )
+
+    def forward(self, actions_hidden_states, vision_hidden_states, vision_hidden_states_v2):
+        batch_size = actions_hidden_states.shape[0]
+        vision_seq_len = vision_hidden_states.shape[1]  # 视觉token数量（如DINOv2的151）
+        vision_seq_len_v2 = vision_hidden_states_v2.shape[1]  # 视觉token数量（如DINOv2的151）
+        
+        # 处理动作特征（保持不变）
+        rearranged_actions = actions_hidden_states.reshape(
+            batch_size, self.num_actions_chunk, -1  # (batch_size, chunk_len, input_dim*ACTION_DIM)
+        )
+        action_features = self.action_proj(rearranged_actions)  # (batch_size, chunk_len, hidden_dim)
+        
+        # 处理视觉特征（核心修改）
+        # 1. 校验视觉特征维度
+        if vision_hidden_states.dim() != 3:
+            vision_hidden_states = vision_hidden_states.view(batch_size, -1, self.vision_dim)
+        
+        # 2. 选取与动作序列长度匹配的视觉token
+        if vision_seq_len >= self.num_actions_chunk:
+            # 策略：跳过[CLS] token，取后续有空间意义的token（更适合机器人任务）
+            # 若视觉token充足，取前num_actions_chunk个非分类token
+            selected_vision_tokens = vision_hidden_states[:, 1 : 1 + self.num_actions_chunk, :]  # (B, chunk_len, vision_dim)
+        else:
+            # 策略：若视觉token不足，重复最后一个token补齐（避免维度不匹配）
+            pad_length = self.num_actions_chunk - vision_seq_len
+            selected_vision_tokens = torch.cat([
+                vision_hidden_states,  # 取全部视觉token
+                vision_hidden_states[:, -1:, :].repeat(1, pad_length, 1)  # 补齐
+            ], dim=1)
+        
+        # 3. 视觉特征投影（每个token单独投影，替代原全局投影）
+        vision_features = self.vision_proj(selected_vision_tokens)  # (B, chunk_len, hidden_dim)
+        # （无需再扩展维度，已与动作序列长度一致）
+        
+        # -----------------------处理第二组主视图的视觉特征----------------------------
+        # 处理视觉特征（核心修改）
+        # 1. 校验视觉特征维度
+        if vision_hidden_states_v2.dim() != 3:
+            vision_hidden_states_v2 = vision_hidden_states_v2.view(batch_size, -1, self.vision_dim)
+
+        # 2. 选取与动作序列长度匹配的视觉token
+        if vision_seq_len_v2 >= self.num_actions_chunk:
+            # 策略：跳过[CLS] token，取后续有空间意义的token（更适合机器人任务）
+            # 若视觉token充足，取前num_actions_chunk个非分类token
+            selected_vision_tokens_v2 = vision_hidden_states_v2[:, 1 : 1 + self.num_actions_chunk, :]  # (B, chunk_len, vision_dim)
+        else:
+            # 策略：若视觉token不足，重复最后一个token补齐（避免维度不匹配）
+            pad_length = self.num_actions_chunk - vision_seq_len_v2
+            selected_vision_tokens_v2 = torch.cat([
+                vision_hidden_states_v2,  # 取全部视觉token
+                vision_hidden_states_v2[:, -1:, :].repeat(1, pad_length, 1)  # 补齐
+            ], dim=1)
+        
+        # 3. 视觉特征投影（每个token单独投影，替代原全局投影）
+        vision_features_v2 = self.vision_proj(selected_vision_tokens_v2)  # (B, chunk_len, hidden_dim)
+        # （无需再扩展维度，已与动作序列长度一致）
+
+
+        # 融合特征并预测动作（保持不变）
+        fused_features = torch.cat([action_features, vision_features, vision_features_v2], dim=-1)  # (B, chunk_len, 3*hidden_dim)
+        action_pred = self.fusion_head(fused_features)  # (B, chunk_len, action_dim)
+        
+        return action_pred
+
+    def predict_action(self, actions_hidden_states, vision_hidden_states):
+        return self.forward(actions_hidden_states, vision_hidden_states)
+    
