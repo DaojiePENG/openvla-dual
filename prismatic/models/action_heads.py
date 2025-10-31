@@ -581,6 +581,6 @@ class VisionActionHead_E2(nn.Module):
         
         return action_pred
 
-    def predict_action(self, actions_hidden_states, vision_hidden_states):
-        return self.forward(actions_hidden_states, vision_hidden_states)
+    def predict_action(self, actions_hidden_states, vision_hidden_states, vision_hidden_states_v2):
+        return self.forward(actions_hidden_states, vision_hidden_states, vision_hidden_states_v2)
     

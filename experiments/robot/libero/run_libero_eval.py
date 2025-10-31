@@ -18,6 +18,7 @@ import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
+import copy
 
 from prismatic.vla.constants import DELAY_KWARGS, save_constants
 
@@ -111,6 +112,7 @@ class GenerateConfig:
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
     use_vision_action_head: bool = True             # 新增: 是否使用视觉-动作融合头
+    use_vision_action_head_e2: bool = False             # 新增: 是否使用e2加强版视觉-动作融合头，优先级更高
     vision_model_id: str = "vit_large_patch14_dinov2.lvd142m"  # 新增: 视觉模型ID (DINOv2-L)
 
     #################################################################################################################
@@ -370,10 +372,13 @@ def run_episode(
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
             replay_images.append(img)
+            # 保存一份没有时延的观测用于后续模型使用，因为会修改observation中的嵌套内容，需要深拷贝
+            observation_real = copy.deepcopy(observation)
+
 
             # 新增：应用评测观测延迟
             if cfg.use_eval_obs_delay:
-                observation, delay_state = apply_evaluation_obs_delay_v1(
+                observation, delay_state = apply_evaluation_obs_delay_v2(
                     observation=observation,
                     timestep=t - cfg.num_steps_wait,  # 有效时间步（减去等待步骤）
                     delay_kwargs=cfg.eval_delay_kwargs,
@@ -387,6 +392,7 @@ def run_episode(
                     cfg,
                     model,
                     observation,
+                    observation_real,
                     task_description,
                     processor=processor,
                     action_head=action_head,

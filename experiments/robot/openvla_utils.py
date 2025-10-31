@@ -26,7 +26,7 @@ import timm
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VisionActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VisionActionHead, VisionActionHead_E2
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -463,7 +463,7 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     return noisy_action_projector
 
 
-def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead, VisionActionHead]:
+def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead, VisionActionHead, VisionActionHead_E2]:
     """
     Get action head for continuous value prediction.
 
@@ -493,6 +493,18 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
                 num_classes=0,  # 不加载分类头
                 img_size=OPENVLA_IMAGE_SIZE,   # 输入图像尺寸
             ).to(DEVICE, dtype=torch.bfloat16)
+        if cfg.use_vision_action_head_e2:
+            action_head = VisionActionHead_E2(input_dim=llm_dim, vision_dim=1024, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+            # 获取vision model
+            logging.info(f"Loading vision model: {cfg.vision_model_id}")
+            # 基础视觉模型加载
+            vision_model = timm.create_model(
+                cfg.vision_model_id,
+                pretrained=True,
+                num_classes=0,  # 不加载分类头
+                img_size=OPENVLA_IMAGE_SIZE,   # 输入图像尺寸
+            ).to(DEVICE, dtype=torch.bfloat16)
+
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
@@ -734,6 +746,7 @@ def get_vla_action(
     vla: torch.nn.Module,
     processor: Any,
     obs: Dict[str, Any],
+    obs_real: Dict[str, Any],
     task_label: str,
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
@@ -761,7 +774,7 @@ def get_vla_action(
 
         # Collect all input images
         all_images = [obs["full_image"]]
-        if cfg.num_images_in_input >= 1:
+        if cfg.num_images_in_input > 1:
             all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
 
         # Process images
@@ -769,14 +782,21 @@ def get_vla_action(
 
         # Extract primary image and additional images
         primary_image = all_images.pop(0)
-        wrist_images = [img for img in all_images] if all_images else []
 
         # Build VLA prompt
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
         # Process primary image
         inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
-        wrist_inputs = processor(prompt, wrist_images).to(DEVICE, dtype=torch.bfloat16)
+
+        # Process images from real observations 这个用来给Action Head做实时观测输入
+        all_images_real = [obs_real["full_image"]]
+        all_images_real.extend([obs_real[k] for k in obs_real.keys() if "wrist" in k])
+        all_images_real = prepare_images_for_vla(all_images_real, cfg)
+        primary_image_real = all_images_real.pop(0)
+        primary_inputs_real = processor(prompt, primary_image_real).to(DEVICE, dtype=torch.bfloat16)
+        wrist_images_real = [img for img in all_images_real] if all_images_real else []
+        wrist_inputs_real = processor(prompt, wrist_images_real).to(DEVICE, dtype=torch.bfloat16)
 
         # Process additional wrist images if any
         if all_images:
@@ -810,7 +830,8 @@ def get_vla_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
-                wrist_images_pixel_values=wrist_inputs["pixel_values"][:, 3:, :, :], # 添加 wrist 视觉输入，取后3通道给DINOv2
+                wrist_images_pixel_values=wrist_inputs_real["pixel_values"][:, 3:, :, :], # 添加 wrist 视觉输入，取后3通道给DINOv2
+                primary_images_pixel_values=primary_inputs_real["pixel_values"][:, 3:, :, :], # 添加 primary 视觉输入，取后3通道给DINOv2
                 use_film=use_film,
             )
 

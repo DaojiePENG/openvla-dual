@@ -891,6 +891,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PROMPT_TOKENS,
         action_head=None,
         wrist_images_pixel_values=None, # 添加 wrist 视觉输入
+        primary_images_pixel_values=None, # 添加 primary 视觉输入
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -931,9 +932,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             if hasattr(action_head, "vision_model") and wrist_images_pixel_values is not None:
                 # Extract wrist vision hidden states using the action head's vision model
                 # 当使用VissionActionHead时，传入wrist视觉输入，action_head中包含vision_model （在openvla_utils.py中实现的添加）
-                vision_hidden_states = action_head.vision_model(wrist_images_pixel_values)
-                # L1 regression prediction with vision input
-                normalized_actions = action_head.predict_action(actions_hidden_states, vision_hidden_states)
+                if type(action_head).__name__ == "VisionActionHead" and isinstance(action_head, nn.Module):
+                    vision_hidden_states = action_head.vision_model(wrist_images_pixel_values)
+                    vision_hidden_states_v2 = action_head.vision_model(primary_images_pixel_values)
+                    # L1 regression prediction with vision input
+                    normalized_actions = action_head.predict_action(actions_hidden_states, vision_hidden_states)
+                if type(action_head).__name__ == "VisionActionHead_E2" and isinstance(action_head, nn.Module):
+                    vision_hidden_states = action_head.vision_model.forward_features(wrist_images_pixel_values)
+                    vision_hidden_states_v2 = action_head.vision_model.forward_features(primary_images_pixel_values)
+                    # L1 regression prediction with vision input
+                    normalized_actions = action_head.predict_action(actions_hidden_states, vision_hidden_states, vision_hidden_states_v2)
             else:
                 # L1 regression prediction without vision input (Normal PrismaticVLM case)
                 normalized_actions = action_head.predict_action(actions_hidden_states)
@@ -964,7 +972,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         proprio=None,
         proprio_projector=None,
         action_head=None,
-        wrist_images_pixel_values=None,
+        wrist_images_pixel_values=None, # 添加 wrist 视觉输入
+        primary_images_pixel_values=None,   # 添加 primary 视觉输入
         noisy_action_projector=None,
         use_film: bool = False,
         **kwargs: str,
@@ -1068,6 +1077,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PROMPT_TOKENS,
                 action_head,
                 wrist_images_pixel_values=wrist_images_pixel_values, # 添加 wrist 视觉输入
+                primary_images_pixel_values=primary_images_pixel_values, # 添加 wrist 视觉输入
             )
 
         # Unnormalize predicted actions
