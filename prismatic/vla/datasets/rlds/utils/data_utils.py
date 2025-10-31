@@ -177,6 +177,7 @@ def get_dataset_statistics(
     dataset: dl.DLataset,
     hash_dependencies: Tuple[str, ...],
     save_dir: Optional[str] = None,
+    save_trajectory_actions: bool = True,  # 新增参数：是否保存轨迹动作
 ) -> Dict:
     """
     Either computes the statistics of a dataset or loads them from a cache file if this function has been called before
@@ -193,19 +194,6 @@ def get_dataset_statistics(
         path = tf.io.gfile.join(save_dir, f"dataset_statistics_{unique_hash}.json")
     else:
         path = local_path
-
-    # check if cache file exists and load
-    if tf.io.gfile.exists(path):
-        overwatch.info(f"Loading existing dataset statistics from {path}.")
-        with tf.io.gfile.GFile(path, "r") as f:
-            metadata = json.load(f)
-        return metadata
-
-    if os.path.exists(local_path):
-        overwatch.info(f"Loading existing dataset statistics from {local_path}.")
-        with open(local_path, "r") as f:
-            metadata = json.load(f)
-        return metadata
 
     dataset = dataset.traj_map(
         lambda traj: {
@@ -228,6 +216,54 @@ def get_dataset_statistics(
         num_transitions += traj["action"].shape[0]
         num_trajectories += 1
 
+    # 新增：创建定义轨迹动作保存路径
+    traj_actions_path = None
+    if save_trajectory_actions:
+        if save_dir is not None:
+            traj_actions_path = tf.io.gfile.join(save_dir, f"trajectory_actions_{unique_hash}.npz")
+        else:
+            traj_actions_path = os.path.expanduser(os.path.join("~", ".cache", "orca", f"trajectory_actions_{unique_hash}.npz"))
+
+    # 检查是否已保存轨迹动作
+    if save_trajectory_actions and tf.io.gfile.exists(traj_actions_path):
+        overwatch.info(f"Trajectory actions already exist at {traj_actions_path}, skipping save.")
+    else:
+        # 原有统计逻辑 + 新增轨迹动作收集
+        overwatch.info("Computing dataset statistics and saving trajectory actions...")
+        actions, proprios, num_transitions, num_trajectories = [], [], 0, 0
+        trajectory_actions = []  # 存储每个轨迹的动作序列
+        for traj in tqdm(dataset.iterator(), total=cardinality if cardinality != tf.data.UNKNOWN_CARDINALITY else None):
+            action_np = traj["action"]  # 转为numpy数组
+            actions.append(action_np)
+            trajectory_actions.append(action_np)  # 按轨迹索引保存
+            proprios.append(traj["proprio"])
+            num_transitions += action_np.shape[0]
+            num_trajectories += 1
+
+        # 保存轨迹动作到npz文件（key为轨迹索引，value为动作序列）
+        if save_trajectory_actions and traj_actions_path is not None:
+            try:
+                np.savez(
+                    traj_actions_path,
+                    **{f"traj_{i}": acts for i, acts in enumerate(trajectory_actions)}
+                )
+                overwatch.info(f"Saved trajectory actions to {traj_actions_path}")
+            except Exception as e:
+                overwatch.warning(f"Failed to save trajectory actions: {e}")
+
+    # check if cache file exists and load
+    if tf.io.gfile.exists(path):
+        overwatch.info(f"Loading existing dataset statistics from {path}.")
+        with tf.io.gfile.GFile(path, "r") as f:
+            metadata = json.load(f)
+        return metadata
+
+    if os.path.exists(local_path):
+        overwatch.info(f"Loading existing dataset statistics from {local_path}.")
+        with open(local_path, "r") as f:
+            metadata = json.load(f)
+        return metadata
+    
     actions, proprios = np.concatenate(actions), np.concatenate(proprios)
     metadata = {
         "action": {

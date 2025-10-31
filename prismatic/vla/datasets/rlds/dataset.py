@@ -218,6 +218,7 @@ def make_dataset_from_rlds(
                 inspect.getsource(standardize_fn) if standardize_fn is not None else "",
             ),
             save_dir=builder.data_dir,
+            save_trajectory_actions=True,  # 启用轨迹动作保存
         )
     dataset_statistics = tree_map(np.array, dataset_statistics)
 
