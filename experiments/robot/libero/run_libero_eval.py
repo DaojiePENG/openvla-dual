@@ -142,30 +142,20 @@ class GenerateConfig:
     use_eval_obs_delay: bool = True  # 是否在评测时启用观测延迟
     # 如果需要覆盖constants中的DELAY_KWARGS，可添加自定义参数
     eval_delay_kwargs: Optional[Dict] = None
-
-    # fmt: on
-
-
-@dataclass
-class DelayKwargs():
-    """配置随机延迟的参数
-    """
+    # eval_delay_kwargs包含以下可选参数：
     use_random_obs: bool = True             # 是否使用随机延迟
-    max_delay_window: int = 20               # 最大延迟步数
+    max_delay_window: int = 20              # 最大延迟步数
     random_seed: int = 42                   # 随机种子
     delay_distribution: str = "uniform"     # 延迟分布类型
     log_delay_info: bool = False            # 是否打印延迟信息
 
-    value: int = 0                          # 用于 deterministic
-    mean: float = 0.0                       # 用于 trunc_normal
-    std: float = 1.0                        # 用于 trunc_normal
-    lambda_: float = 1.0                    # 用于 exponential
+    value: int = 16                          # 用于 deterministic
+    mean: float = 4.0                       # 用于 trunc_normal
+    std: float = 5.0                        # 用于 trunc_normal
+    lambda_: float = 0.25                    # 用于 exponential
 
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    # fmt: on
 
-    def __call__(self) -> Dict:
-        return self.to_dict()
 
 def validate_config(cfg: GenerateConfig) -> None:
     """Validate configuration parameters."""
@@ -247,9 +237,11 @@ def setup_logging(cfg: GenerateConfig):
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
 
-    # 保存constants参数
-    cfg.eval_delay_kwargs['use_eval_obs_delay'] = cfg.use_eval_obs_delay # 保存是否启用观测延迟的参数
-    save_constants(os.path.join(cfg.local_log_dir, run_id + "constants"), cfg.eval_delay_kwargs)
+    # 保存cfg参数
+    cfg_filepath = os.path.join(cfg.local_log_dir, run_id + "_cfg.json")
+    with open(cfg_filepath, 'w', encoding='utf-8') as f:
+        json.dump(asdict(cfg), f, indent=4, ensure_ascii=False)
+    logger.info(f"Config parameters have been saved to: {cfg_filepath}")
 
     # Initialize Weights & Biases logging if enabled
     if cfg.use_wandb:
@@ -524,7 +516,17 @@ def run_task(
 def eval_libero(cfg: GenerateConfig) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
     # If using default initial states, set cfg.eval_delay_kwargs to None
-    cfg.eval_delay_kwargs = DelayKwargs().to_dict()
+    cfg.eval_delay_kwargs = DELAY_KWARGS
+    # Support custom delay kwargs from cfg
+    cfg.eval_delay_kwargs['use_random_obs'] = cfg.use_random_obs
+    cfg.eval_delay_kwargs['max_delay_window'] = cfg.max_delay_window
+    cfg.eval_delay_kwargs['random_seed'] = cfg.random_seed
+    cfg.eval_delay_kwargs['delay_distribution'] = cfg.delay_distribution
+    cfg.eval_delay_kwargs['log_delay_info'] = cfg.log_delay_info
+    cfg.eval_delay_kwargs['value'] = cfg.value
+    cfg.eval_delay_kwargs['mean'] = cfg.mean
+    cfg.eval_delay_kwargs['std'] = cfg.std
+    cfg.eval_delay_kwargs['lambda_'] = cfg.lambda_
 
     # Validate configuration
     validate_config(cfg)
