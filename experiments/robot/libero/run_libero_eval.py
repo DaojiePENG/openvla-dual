@@ -205,6 +205,12 @@ def setup_logging(cfg: GenerateConfig):
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
 
+    # 保存cfg参数
+    cfg_filepath = os.path.join(cfg.local_log_dir, run_id + "_cfg.json")
+    with open(cfg_filepath, 'w', encoding='utf-8') as f:
+        json.dump(asdict(cfg), f, indent=4, ensure_ascii=False)
+    logger.info(f"Config parameters have been saved to: {cfg_filepath}")
+
     # Initialize Weights & Biases logging if enabled
     if cfg.use_wandb:
         wandb.init(

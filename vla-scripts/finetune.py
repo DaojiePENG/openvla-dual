@@ -7,7 +7,9 @@ Fine-tunes OpenVLA via LoRA.
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+import json
+import yaml
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
 
@@ -811,6 +813,19 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Initialize wandb logging
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+    
+    # 保存训练配置文件到运行目录，仅主进程执行
+    if distributed_state.is_main_process:
+        # 将配置转换为字典，并将所有Path对象转为字符串
+        cfg_dict = asdict(cfg)
+        for key, value in cfg_dict.items():
+            if isinstance(value, Path):
+                cfg_dict[key] = str(value)
+        with open(run_dir / "finetune_config.json", "w", encoding='utf-8') as f:
+            json.dump(cfg_dict, f, indent=4, ensure_ascii=False)
+        with open(run_dir / "finetune_config.yaml", "w", encoding='utf-8') as f:
+            yaml.dump(cfg_dict, f, allow_unicode=True)
+        logging.info(f"Config parameters have been saved to: {run_dir / 'finetune_config.json'} and finetune_config.yaml")
 
     # Print detected constants
     print(
