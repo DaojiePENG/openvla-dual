@@ -122,6 +122,10 @@ def apply_random_observation_delay_v1(
     # 验证主视图是否存在
     if "image_primary" not in traj["observation"]:
         logging.warning("轨迹观测中不存在 'image_primary'，不应用延迟")
+        traj["observation_real"] = tf.nest.map_structure(
+        lambda x: x,  # 不进行延迟，直接保留原始数据
+        traj["observation"]  # 原始 observation 数据
+    )
         return traj
 
     logging.info("=" * 88)
@@ -235,6 +239,10 @@ def apply_random_observation_delay_v2(
     # 设置全局随机种子，确保可复现（可能还需要设置 num_parallel_calls=1或None来保证完全复现）
     tf.random.set_seed(random_seed)
     if not use_random_obs or max_delay_window <= 0:
+        traj["observation_real"] = tf.nest.map_structure(
+        lambda x: x,  # 不进行延迟，直接保留原始数据
+        traj["observation"]  # 原始 observation 数据
+    )
         return traj
 
     logging.info("=" * 88)

@@ -33,13 +33,13 @@ class DelayKwargs():
     use_random_obs: bool = True             # 是否使用随机延迟
     max_delay_window: int = 20               # 最大延迟步数
     random_seed: int = 42                   # 随机种子
-    delay_distribution: str = "uniform"     # 延迟分布类型
+    delay_distribution: str = "exponential"     # 延迟分布类型
     log_delay_info: bool = False            # 是否打印延迟信息
 
     value: int = 0                          # 用于 deterministic
-    mean: float = 0.0                       # 用于 trunc_normal
-    std: float = 1.0                        # 用于 trunc_normal
-    lambda_: float = 1.0                    # 用于 exponential
+    mean: float = 4.0                       # 用于 trunc_normal
+    std: float = 5.0                        # 用于 trunc_normal
+    lambda_: float = 0.25                    # 用于 exponential
 
     def to_dict(self) -> Dict:
         return asdict(self)
