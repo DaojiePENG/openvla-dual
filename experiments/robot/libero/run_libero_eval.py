@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
