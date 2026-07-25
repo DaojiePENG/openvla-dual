@@ -6,11 +6,13 @@
 #   # 前台运行
 #   ./train_local_object.sh --gpus 0,1,2,3       # Use specific GPU IDs
 #   ./train_local_object.sh --num_gpus 4          # Use first 4 GPUs
-#   ./train_local_object.sh                       # Use all available GPUs
+#   ./train_local_object.sh                       # Use all GPUs; auto-resume latest checkpoint by default
+#   ./train_local_object.sh --no_resume           # Explicitly start a fresh run
+#   ./train_local_object.sh --resume_from_checkpoint /path/to/checkpoint
 #
 #   # 后台运行 (终端断开不影响)
 #   nohup bash ./train_local_object.sh --num_gpus 2 &
-#   nohup bash ./train_local_object.sh --gpus 6,7 &
+#   nohup bash ./train_local_object.sh --gpus 0,1 &
 #
 #   # 自动日志: logs/train_gpu2_3850979.log (PID自动追加)
 #   # 同一命令多次运行，日志不会覆盖
@@ -27,11 +29,16 @@
 GPU_IDS=""
 NUM_GPUS=""
 RUN_ID=""
+RESUME=true
+RESUME_FROM_CHECKPOINT="auto"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --gpus) GPU_IDS="$2"; shift 2 ;;
         --num_gpus) NUM_GPUS="$2"; shift 2 ;;
         --run_id) RUN_ID="$2"; shift 2 ;;
+        --resume) RESUME=true; RESUME_FROM_CHECKPOINT="auto"; shift ;;
+        --resume_from_checkpoint) RESUME=true; RESUME_FROM_CHECKPOINT="$2"; shift 2 ;;
+        --no_resume) RESUME=false; RESUME_FROM_CHECKPOINT=""; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -87,7 +94,14 @@ exec > logs/train_${RUN_ID}_${LOG_PID}.log 2> logs/train_${RUN_ID}_${LOG_PID}.er
 VLA_PATH="/home/sheng/workspace/openvla-7b-oft-finetuned-libero-spatial-object-goal-10"
 DATA_ROOT_DIR="/home/sheng/workspace/modified_libero_rlds"
 DATASET_NAME="libero_object_no_noops"
-RUN_ROOT_DIR="/home/sheng/workspace/openvla-oft/runs"
+RUN_ROOT_DIR="/home/sheng/workspace/openvla-oft/runs_2"
+# Auto-resume searches both RUN_ROOT_DIR (new checkpoints) and this legacy checkpoint root.
+RESUME_ROOT_DIR="/home/sheng/workspace/openvla-oft/runs"
+
+RESUME_ARGS=(--resume "${RESUME}")
+if [ "${RESUME}" = true ]; then
+    RESUME_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}" --resume_root_dir "${RESUME_ROOT_DIR}")
+fi
 
 # VisionActionHead Configuration
 USE_VISION_ACTION_HEAD=true
@@ -105,7 +119,7 @@ WINDOW_SIZE=21
 # λ linearly ramps from 0 → STALE_LOSS_LAMBDA_MAX over WARMUP steps, then holds.
 # Set WARMUP to -1 for auto (= max_steps/2).
 STALE_LOSS_LAMBDA_MAX=0.5
-STALE_LOSS_WARMUP_STEPS=-1
+STALE_LOSS_WARMUP_STEPS=80000
 
 # Training hyperparameters
 BATCH_SIZE=4                    # Halved from 8: frame_delay does 2 sequential forwards, each uses half the memory
@@ -127,6 +141,9 @@ echo "Log: logs/train_${RUN_ID}_${LOG_PID}.log"
 echo "Err: logs/train_${RUN_ID}_${LOG_PID}.err"
 echo "PID: logs/train_${RUN_ID}_${LOG_PID}.pid"
 echo "Dataset: ${DATASET_NAME}"
+echo "Resume training: ${RESUME}"
+echo "Resume checkpoint: ${RESUME_FROM_CHECKPOINT:-disabled}"
+echo "Resume search root: ${RESUME_ROOT_DIR}"
 echo "Batch Size: ${BATCH_SIZE} (effective: $((BATCH_SIZE * GRAD_ACCUM_STEPS * NUM_GPUS)))"
 echo "Grad Accum Steps: ${GRAD_ACCUM_STEPS}"
 echo "Learning Rate: ${LEARNING_RATE}"
@@ -150,6 +167,7 @@ torchrun --nproc_per_node=${NUM_GPUS} --master_port=${MASTER_PORT} vla-scripts/f
     --data_root_dir "${DATA_ROOT_DIR}" \
     --dataset_name "${DATASET_NAME}" \
     --run_root_dir "${RUN_ROOT_DIR}" \
+    "${RESUME_ARGS[@]}" \
     --batch_size ${BATCH_SIZE} \
     --grad_accumulation_steps ${GRAD_ACCUM_STEPS} \
     --learning_rate ${LEARNING_RATE} \

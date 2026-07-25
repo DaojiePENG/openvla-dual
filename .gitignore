@@ -156,4 +156,5 @@ wandb/
 # Logs and checkpoints
 logs/
 runs/
+runs_*/
 results/

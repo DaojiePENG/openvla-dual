@@ -4,9 +4,11 @@ finetune.py
 Fine-tunes OpenVLA via LoRA.
 """
 
+import json
 import os
+import re
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
@@ -97,8 +99,10 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = False                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume: bool = False                             # If True, resumes training instead of initializing trainable weights
+    resume_from_checkpoint: Optional[str] = None     # Checkpoint directory, or "auto" to select the latest for this run
+    resume_root_dir: Optional[Path] = None           # Optional additional root searched by automatic checkpoint discovery
+    resume_step: Optional[int] = None                # Optional checkpoint step override/validation (normally inferred)
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -172,12 +176,6 @@ def get_run_id(cfg) -> str:
     if cfg.run_id_override is not None:
         # Override the run ID with the user-provided ID
         run_id = cfg.run_id_override
-    elif cfg.resume:
-        # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
-        # Remove the "--XXX_chkpt" suffix from the run ID if it exists
-        if "chkpt" in run_id.split("--")[-1]:
-            run_id = "--".join(run_id.split("--")[:-1])
     else:
         run_id = (
             f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
@@ -193,7 +191,147 @@ def get_run_id(cfg) -> str:
     return run_id
 
 
-def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
+CHECKPOINT_DIR_PATTERN = re.compile(r"--(?P<step>\d+)_chkpt$")
+CHECKPOINT_METADATA_FILENAME = "checkpoint_metadata.json"
+TRAINING_STATE_FILENAME = "training_state.pt"
+
+
+def get_checkpoint_step(checkpoint_dir: Path, explicit_step: Optional[int] = None) -> int:
+    """Infer a checkpoint's completed optimizer step from its directory name."""
+    checkpoint_dir = Path(checkpoint_dir)
+    match = CHECKPOINT_DIR_PATTERN.search(checkpoint_dir.name)
+    inferred_step = int(match.group("step")) if match else None
+
+    metadata_path = checkpoint_dir / CHECKPOINT_METADATA_FILENAME
+    if inferred_step is None and metadata_path.is_file():
+        with metadata_path.open("r", encoding="utf-8") as metadata_file:
+            inferred_step = int(json.load(metadata_file)["global_step"])
+
+    if explicit_step is not None:
+        if inferred_step is not None and inferred_step != explicit_step:
+            raise ValueError(
+                f"resume_step={explicit_step} does not match checkpoint directory step {inferred_step}: "
+                f"{checkpoint_dir}"
+            )
+        return explicit_step
+
+    if inferred_step is None:
+        raise ValueError(
+            f"Cannot infer resume step from checkpoint directory `{checkpoint_dir}`. "
+            "Use a directory ending in `--<step>_chkpt` or pass --resume_step explicitly."
+        )
+    return inferred_step
+
+
+def get_component_checkpoint_path(module_name: str, checkpoint_dir: Path, step: int) -> Path:
+    """Return the saved state-dict path for a trainable non-LoRA component."""
+    checkpoint_dir = Path(checkpoint_dir)
+    numbered_path = checkpoint_dir / f"{module_name}--{step}_checkpoint.pt"
+    latest_path = checkpoint_dir / f"{module_name}--latest_checkpoint.pt"
+    if numbered_path.is_file():
+        return numbered_path
+    if latest_path.is_file():
+        return latest_path
+    return numbered_path
+
+
+def validate_resume_checkpoint(cfg: FinetuneConfig, checkpoint_dir: Path, step: int) -> None:
+    """Fail early when a checkpoint cannot restore every enabled trainable model component."""
+    checkpoint_dir = Path(checkpoint_dir)
+    missing_paths = []
+    adapter_dir = checkpoint_dir / "lora_adapter"
+    if not (adapter_dir / "adapter_config.json").is_file():
+        missing_paths.append(adapter_dir / "adapter_config.json")
+    if not any((adapter_dir / filename).is_file() for filename in ("adapter_model.safetensors", "adapter_model.bin")):
+        missing_paths.append(adapter_dir / "adapter_model.{safetensors,bin}")
+
+    component_names = []
+    if cfg.use_proprio:
+        component_names.append("proprio_projector")
+    if cfg.use_l1_regression or cfg.use_diffusion:
+        component_names.append("action_head")
+    if cfg.use_diffusion:
+        component_names.append("noisy_action_projector")
+    if cfg.use_film:
+        component_names.append("vision_backbone")
+
+    for module_name in component_names:
+        component_path = get_component_checkpoint_path(module_name, checkpoint_dir, step)
+        if not component_path.is_file():
+            missing_paths.append(component_path)
+
+    if missing_paths:
+        formatted_paths = "\n".join(f"  - {path}" for path in missing_paths)
+        raise FileNotFoundError(
+            f"Checkpoint `{checkpoint_dir}` is incomplete for the requested training configuration. Missing:\n"
+            f"{formatted_paths}"
+        )
+
+
+def resolve_resume_checkpoint(cfg: FinetuneConfig, run_id: str) -> Tuple[Optional[Path], int]:
+    """Resolve an explicit checkpoint or select the numerically latest valid checkpoint for this run."""
+    if not cfg.resume:
+        return None, 0
+
+    resume_source = cfg.resume_from_checkpoint or "auto"
+    if resume_source != "auto":
+        checkpoint_dir = Path(resume_source).expanduser().resolve()
+        if not checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory does not exist: {checkpoint_dir}")
+        step = get_checkpoint_step(checkpoint_dir, cfg.resume_step)
+        validate_resume_checkpoint(cfg, checkpoint_dir, step)
+        return checkpoint_dir, step
+
+    search_roots = [Path(cfg.run_root_dir)]
+    if cfg.resume_root_dir is not None:
+        search_roots.append(Path(cfg.resume_root_dir))
+
+    candidates = []
+    seen_paths = set()
+    for root in search_roots:
+        root = root.expanduser().resolve()
+        for checkpoint_dir in root.glob(f"{run_id}--*_chkpt"):
+            checkpoint_dir = checkpoint_dir.resolve()
+            if checkpoint_dir in seen_paths or not checkpoint_dir.is_dir():
+                continue
+            seen_paths.add(checkpoint_dir)
+            try:
+                step = get_checkpoint_step(checkpoint_dir)
+                validate_resume_checkpoint(cfg, checkpoint_dir, step)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"Skipping invalid resume checkpoint `{checkpoint_dir}`: {exc}")
+                continue
+            candidates.append((step, checkpoint_dir))
+
+        # `save_latest_checkpoint_only=True` stores the checkpoint directly in the base run directory.
+        latest_checkpoint_dir = (root / run_id).resolve()
+        if latest_checkpoint_dir not in seen_paths and (latest_checkpoint_dir / CHECKPOINT_METADATA_FILENAME).is_file():
+            seen_paths.add(latest_checkpoint_dir)
+            try:
+                step = get_checkpoint_step(latest_checkpoint_dir)
+                validate_resume_checkpoint(cfg, latest_checkpoint_dir, step)
+            except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                print(f"Skipping invalid latest resume checkpoint `{latest_checkpoint_dir}`: {exc}")
+            else:
+                candidates.append((step, latest_checkpoint_dir))
+
+    if not candidates:
+        roots = ", ".join(str(Path(root).expanduser().resolve()) for root in search_roots)
+        raise FileNotFoundError(
+            f"No valid checkpoint found for run `{run_id}` under: {roots}. "
+            "Pass --resume_from_checkpoint explicitly or use --resume false for a fresh run."
+        )
+
+    step, checkpoint_dir = max(candidates, key=lambda item: item[0])
+    if cfg.resume_step is not None and cfg.resume_step != step:
+        raise ValueError(
+            f"Automatic resume selected step {step}, but --resume_step={cfg.resume_step}. "
+            "Pass the desired checkpoint directory explicitly."
+        )
+    return checkpoint_dir, step
+
+
+def load_checkpoint(module_name: str, path: Path, step: int, device: str = "cpu") -> dict:
     """
     Loads a checkpoint for a given module.
 
@@ -206,10 +344,49 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     Returns:
         dict: PyTorch model state dictionary.
     """
-    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    checkpoint_path = get_component_checkpoint_path(module_name, path, step)
     print(f"Loading checkpoint: {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
     return remove_ddp_in_checkpoint(state_dict)
+
+
+def restore_training_state(
+    checkpoint_dir: Path,
+    resume_step: int,
+    optimizer: torch.optim.Optimizer,
+    scheduler: MultiStepLR,
+) -> bool:
+    """Restore optimizer/scheduler state, with a schedule-only fallback for legacy checkpoints."""
+    training_state_path = Path(checkpoint_dir) / TRAINING_STATE_FILENAME
+    if training_state_path.is_file():
+        print(f"Loading training state: {training_state_path}")
+        training_state = torch.load(training_state_path, weights_only=True, map_location="cpu")
+        saved_step = int(training_state["global_step"])
+        if saved_step != resume_step:
+            raise ValueError(
+                f"Training state step {saved_step} does not match checkpoint step {resume_step}: {training_state_path}"
+            )
+        optimizer.load_state_dict(training_state["optimizer"])
+        scheduler_state = training_state["lr_scheduler"]
+        scheduler_state["milestones"] = Counter(scheduler_state["milestones"])
+        scheduler.load_state_dict(scheduler_state)
+        print(f"Restored optimizer and LR scheduler at step {resume_step}")
+        return True
+
+    # Checkpoints created before resumeTraining support have model weights only. Reconstruct the LR phase so that
+    # training does not incorrectly restart the decay schedule, while transparently starting fresh Adam moments.
+    decay_power = sum(count for milestone, count in scheduler.milestones.items() if resume_step >= milestone)
+    resumed_lrs = [base_lr * (scheduler.gamma**decay_power) for base_lr in scheduler.base_lrs]
+    for param_group, resumed_lr in zip(optimizer.param_groups, resumed_lrs):
+        param_group["lr"] = resumed_lr
+    scheduler.last_epoch = resume_step
+    scheduler._step_count = resume_step + 1
+    scheduler._last_lr = resumed_lrs
+    print(
+        f"WARNING: `{training_state_path}` is absent (legacy checkpoint). LoRA/Head/projector weights and LR "
+        "progress are restored, but Adam moments start fresh. New checkpoints will include full training state."
+    )
+    return False
 
 
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
@@ -248,6 +425,7 @@ def init_module(
     cfg: FinetuneConfig,
     device_id: int,
     module_args: dict,
+    resume_checkpoint: Optional[Path] = None,
     to_bf16: bool = False,
     find_unused_params: bool = False,
 ) -> DDP:
@@ -260,6 +438,7 @@ def init_module(
         cfg (FinetuneConfig): Training configuration.
         device_id (str): Device ID.
         module_args (dict): Args for initializing the module.
+        resume_checkpoint (Path): Checkpoint directory to load, or None for fresh initialization.
         to_bf16 (bool): Whether to convert to torch.bfloat16 data type.
         find_unused_params (bool): Whether to detect parameters without gradients in distributed training.
 
@@ -269,8 +448,8 @@ def init_module(
     module = module_class(**module_args)
     count_parameters(module, module_name)
 
-    if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+    if resume_checkpoint is not None:
+        state_dict = load_checkpoint(module_name, resume_checkpoint, cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -331,6 +510,8 @@ def run_forward_pass(
     Args:
         vla (OpenVLAForActionPrediction): Vision-language-action policy.
         action_head (nn.Module): Action head module.
+        optimizer (Optimizer): Optimizer whose moments should be saved for resume.
+        scheduler (LRScheduler): Learning-rate scheduler whose progress should be saved for resume.
         noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
         proprio_projector (nn.Module): Proprioceptive state projector module.
         batch (dict): Input batch.
@@ -687,6 +868,8 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    optimizer,
+    scheduler,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -722,6 +905,10 @@ def save_training_checkpoint(
     if distributed_state.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
+        # Invalidate an overwritten "latest" checkpoint until all resume-critical files have been saved again.
+        metadata_path = checkpoint_dir / CHECKPOINT_METADATA_FILENAME
+        if metadata_path.exists():
+            metadata_path.unlink()
         save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
         print(f"Saving Model Checkpoint for Step {log_step}")
 
@@ -751,6 +938,26 @@ def save_training_checkpoint(
             torch.save(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
             )
+
+        # Save the non-model state needed for a true continuation. Legacy checkpoints without this file remain
+        # resumable via a schedule-only fallback, but cannot recover Adam moments.
+        training_state_path = checkpoint_dir / TRAINING_STATE_FILENAME
+        temporary_training_state_path = checkpoint_dir / f".{TRAINING_STATE_FILENAME}.tmp"
+        scheduler_state = scheduler.state_dict()
+        scheduler_state["milestones"] = dict(scheduler_state["milestones"])
+        torch.save(
+            {
+                "format_version": 1,
+                "global_step": log_step,
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": scheduler_state,
+            },
+            temporary_training_state_path,
+        )
+        os.replace(temporary_training_state_path, training_state_path)
+        with (checkpoint_dir / CHECKPOINT_METADATA_FILENAME).open("w", encoding="utf-8") as metadata_file:
+            json.dump({"format_version": 1, "global_step": log_step}, metadata_file)
+            metadata_file.write("\n")
 
     # Wait for model components to be saved
     dist.barrier()
@@ -894,12 +1101,27 @@ def finetune(cfg: FinetuneConfig) -> None:
             "VisionActionHead num_views must match num_images_in_input."
         )
 
+    # An explicit checkpoint implies resume mode; `vla_path` always remains the clean base model path.
+    if cfg.resume_from_checkpoint is not None:
+        cfg.resume = True
+
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
     # Get experiment run ID
     run_id = get_run_id(cfg)
+
+    # Resolve before loading the model so every trainable component uses the same checkpoint and step.
+    resume_checkpoint, resume_step = resolve_resume_checkpoint(cfg, run_id)
+    cfg.resume_step = resume_step if cfg.resume else None
+    if resume_checkpoint is not None:
+        if resume_step >= cfg.max_steps:
+            raise ValueError(
+                f"Checkpoint step {resume_step} has already reached max_steps={cfg.max_steps}. "
+                "Increase --max_steps to continue training."
+            )
+        print(f"Resuming run `{run_id}` from step {resume_step}: {resume_checkpoint}")
 
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
@@ -965,16 +1187,21 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
-    # LoRA setup
+    # LoRA setup: restore the trainable adapter itself on resume (do not stack a random adapter on a merged model).
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        if resume_checkpoint is not None:
+            adapter_dir = resume_checkpoint / "lora_adapter"
+            print(f"Loading trainable LoRA adapter: {adapter_dir}")
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     # FiLM setup
@@ -989,8 +1216,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             llm_dim=vla.llm_dim,
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
-        if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+        if resume_checkpoint is not None:
+            state_dict = load_checkpoint("vision_backbone", resume_checkpoint, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
@@ -1005,6 +1232,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            resume_checkpoint=resume_checkpoint,
         )
 
     # If applicable, instantiate continuous action head for L1 regression
@@ -1023,6 +1251,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     "freeze_vision_encoder": cfg.freeze_action_head_vision,
                     "num_views": cfg.action_head_num_views,
                 },
+                resume_checkpoint=resume_checkpoint,
                 to_bf16=True,
             )
         else:
@@ -1032,6 +1261,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 cfg,
                 device_id,
                 {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+                resume_checkpoint=resume_checkpoint,
                 to_bf16=True,
             )
 
@@ -1048,10 +1278,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
             },
+            resume_checkpoint=resume_checkpoint,
             to_bf16=True,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector,
+            "noisy_action_projector",
+            cfg,
+            device_id,
+            {"llm_dim": vla.module.llm_dim},
+            resume_checkpoint=resume_checkpoint,
         )
 
     # Get number of vision patches
@@ -1083,6 +1319,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
+    if resume_checkpoint is not None:
+        restore_training_state(resume_checkpoint, resume_step, optimizer, scheduler)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1188,7 +1426,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     }
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    start_step = resume_step if cfg.resume else 0
+    with tqdm.tqdm(total=cfg.max_steps, initial=start_step, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1197,9 +1436,12 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Curriculum λ: linearly ramp from 0 → λ_max over warmup_steps, then hold
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-            cur_step = gradient_step_idx + (cfg.resume_step if cfg.resume else 0)
+            cur_step = start_step + gradient_step_idx
+            log_step = cur_step + 1
             dual_path_enabled = cfg.use_frame_delay and cfg.use_vision_action_head
-            cur_stale_weight = compute_stale_loss_weight(cur_step, stale_loss_warmup_steps, cfg.stale_loss_lambda_max, dual_path_enabled)
+            cur_stale_weight = compute_stale_loss_weight(
+                cur_step, stale_loss_warmup_steps, cfg.stale_loss_lambda_max, dual_path_enabled
+            )
 
             loss, metrics = run_forward_pass(
                 vla=vla,
@@ -1235,18 +1477,17 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = cur_step
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                lr_progress = min(log_step / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
 
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 # Log the learning rate
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
@@ -1263,44 +1504,46 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
-                    vla=vla,
-                    processor=processor,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
-                    train_dataset=train_dataset,
-                    distributed_state=distributed_state,
-                )
+                # Save only after an optimizer update, so model and training state describe exactly the same step.
+                if log_step % cfg.save_freq == 0:
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=run_dir,
+                        log_step=log_step,
+                        vla=vla,
+                        processor=processor,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                        action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        train_dataset=train_dataset,
+                        distributed_state=distributed_state,
+                    )
 
-            # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
-                run_validation(
-                    vla=vla,
-                    action_head=action_head,
-                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    val_dataloader=val_dataloader,
-                    action_tokenizer=action_tokenizer,
-                    device_id=device_id,
-                    cfg=cfg,
-                    num_patches=NUM_PATCHES,
-                    log_step=log_step,
-                    distributed_state=distributed_state,
-                    val_time_limit=cfg.val_time_limit,
-                )
-                # Set model back to training mode after validation
-                vla.train()
+                # Test model on validation set
+                if cfg.use_val_set and log_step % cfg.val_freq == 0:
+                    run_validation(
+                        vla=vla,
+                        action_head=action_head,
+                        noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        val_dataloader=val_dataloader,
+                        action_tokenizer=action_tokenizer,
+                        device_id=device_id,
+                        cfg=cfg,
+                        num_patches=NUM_PATCHES,
+                        log_step=log_step,
+                        distributed_state=distributed_state,
+                        val_time_limit=cfg.val_time_limit,
+                    )
+                    # Set model back to training mode after validation
+                    vla.train()
 
-            # Stop training when max_steps is reached
-            if log_step == cfg.max_steps:
-                print(f"Max step {cfg.max_steps} reached! Stopping training...")
-                break
+                # max_steps is the total target step, not the number of additional steps after resuming.
+                if log_step >= cfg.max_steps:
+                    print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                    break
 
 
 if __name__ == "__main__":
