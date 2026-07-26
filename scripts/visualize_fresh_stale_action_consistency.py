@@ -1,12 +1,15 @@
-"""Compare fresh-vs-stale action consistency for matched VisionActionHead models.
+"""Compare fresh-vs-stale action consistency across OFT and CloudEdge models.
 
-For every current observation t, this script keeps the edge vision feature z_t
-fixed and replaces only the cloud planning feature h_t with h_{t-d}. The metric
-is the mean absolute action drift in normalized action space:
+For every current observation t, this script replaces the cloud planning feature
+h_t with h_{t-d}. For CloudEdge models, the current edge feature z_t is held
+fixed. Standard OFT has no edge feature and therefore uses g(h) directly. The
+metric is the mean absolute action drift in normalized action space:
 
     D(d) = mean |g(h_t, z_t) - g(h_{t-d}, z_t)|.
 
 Lower drift means that the policy is less sensitive to cloud-feature staleness.
+Cloud hidden states are extracted with the same normalized proprioceptive input
+used during training and normal LIBERO evaluation.
 """
 
 import argparse
@@ -15,7 +18,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 
@@ -29,12 +32,26 @@ from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
 
 DEFAULT_DELAYS = [0, 1, 3, 5, 8, 10, 15, 20]
-COLORS = {"Single-frame": "#E76F51", "CloudEdgeVLA": "#2563EB"}
+MODEL_ORDER = ("OpenVLA-OFT", "CloudEdge baseline", "CloudEdgeVLA")
+COLORS = {
+    "OpenVLA-OFT": "#64748B",
+    "CloudEdge baseline": "#E76F51",
+    "CloudEdgeVLA": "#2563EB",
+}
+MARKERS = {"OpenVLA-OFT": "^", "CloudEdge baseline": "s", "CloudEdgeVLA": "o"}
+LINESTYLES = {"OpenVLA-OFT": ":", "CloudEdge baseline": "--", "CloudEdgeVLA": "-"}
 
 
 @torch.inference_mode()
-def predict_from_cached_features(action_head, hidden_state, vision_feature) -> torch.Tensor:
-    """Run only the fusion layers using cached cloud and edge features."""
+def predict_from_cached_features(
+    action_head,
+    hidden_state: torch.Tensor,
+    vision_feature: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Run the action head from cached features, with edge vision when supported."""
+    if vision_feature is None:
+        return action_head.predict_action(hidden_state).float()
+
     batch_size = hidden_state.shape[0]
     llm_feature = hidden_state.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
     vision_projected = action_head.vision_projector(vision_feature)
@@ -48,7 +65,8 @@ def extract_cached_features(
     observations: Dict[str, List[dict]],
     lora_rank: int,
     num_views: int,
-) -> Tuple[object, Dict[str, List[torch.Tensor]], Dict[str, List[torch.Tensor]]]:
+    uses_edge_vision: bool,
+) -> Tuple[object, Dict[str, List[torch.Tensor]], Dict[str, List[Optional[torch.Tensor]]]]:
     """Load one checkpoint and extract cloud hidden states and edge features."""
     print(f"[INFO] Loading {checkpoint}", flush=True)
     vla, action_head, processor, cfg = attr.load_model(
@@ -56,17 +74,26 @@ def extract_cached_features(
         lora_rank=lora_rank,
         action_head_vision_encoder="siglip-base",
         num_views=num_views,
+        use_vision_action_head=uses_edge_vision,
     )
+    from experiments.robot.openvla_utils import get_proprio_projector, normalize_proprio
+
     action_head.eval()
+    proprio_projector = get_proprio_projector(cfg, vla.llm_dim, proprio_dim=8)
+    proprio_projector.eval()
+    proprio_norm_stats = vla.norm_stats["libero_goal_no_noops"]["proprio"]
     image_cfg = SimpleNamespace(num_images_in_input=num_views, center_crop=cfg.center_crop)
     tokenizer = processor.tokenizer
     hidden_by_task: Dict[str, List[torch.Tensor]] = {}
-    vision_by_task: Dict[str, List[torch.Tensor]] = {}
+    vision_by_task: Dict[str, List[Optional[torch.Tensor]]] = {}
 
     for task_index, (task_description, frames) in enumerate(observations.items(), start=1):
         hidden_states: List[torch.Tensor] = []
-        vision_features: List[torch.Tensor] = []
+        vision_features: List[Optional[torch.Tensor]] = []
         for frame in frames:
+            proprio = normalize_proprio(
+                np.asarray(frame["state"], dtype=np.float32), proprio_norm_stats
+            )
             pixels = attr.obs_to_pixel_values(frame, processor, image_cfg).to(
                 attr.DEVICE, dtype=torch.bfloat16
             )
@@ -83,13 +110,15 @@ def extract_cached_features(
                     pixel_values=pixels,
                     attention_mask=torch.ones_like(input_ids),
                     unnorm_key="libero_goal_no_noops",
+                    proprio=proprio,
+                    proprio_projector=proprio_projector,
                     action_head=action_head,
                 )
-                vision = action_head.encode_vision(pixels)
+                vision = action_head.encode_vision(pixels) if uses_edge_vision else None
             if capture.hidden_states is None:
                 raise RuntimeError("Failed to capture cloud hidden state")
             hidden_states.append(capture.hidden_states.detach().clone())
-            vision_features.append(vision.detach().clone())
+            vision_features.append(vision.detach().clone() if vision is not None else None)
         hidden_by_task[task_description] = hidden_states
         vision_by_task[task_description] = vision_features
         print(
@@ -98,7 +127,7 @@ def extract_cached_features(
             flush=True,
         )
 
-    del vla, processor
+    del vla, processor, proprio_projector
     gc.collect()
     torch.cuda.empty_cache()
     return action_head, hidden_by_task, vision_by_task
@@ -108,11 +137,12 @@ def compute_action_drift(
     action_head,
     observations: Dict[str, List[dict]],
     hidden_by_task: Dict[str, List[torch.Tensor]],
-    vision_by_task: Dict[str, List[torch.Tensor]],
+    vision_by_task: Dict[str, List[Optional[torch.Tensor]]],
     delays: List[int],
     max_samples_per_task: int,
-) -> Dict[int, List[float]]:
+) -> Tuple[Dict[int, List[float]], Dict[str, List[float]]]:
     results: Dict[int, List[float]] = defaultdict(list)
+    diagnostics: Dict[str, List[float]] = defaultdict(list)
     for task_description, frames in observations.items():
         hidden = hidden_by_task[task_description]
         vision = vision_by_task[task_description]
@@ -120,6 +150,31 @@ def compute_action_drift(
             predict_from_cached_features(action_head, h, z)
             for h, z in zip(hidden, vision)
         ]
+        for action, h, z in zip(fresh_actions, hidden, vision):
+            diagnostics["fresh_action_magnitude"].append(
+                float(torch.mean(torch.abs(action)).item())
+            )
+            planning_ablated = predict_from_cached_features(
+                action_head, torch.zeros_like(h), z
+            )
+            planning_effect = torch.mean(torch.abs(action - planning_ablated)).item()
+            diagnostics["planning_ablation_effect"].append(float(planning_effect))
+            if z is not None:
+                vision_ablated = predict_from_cached_features(
+                    action_head, h, torch.zeros_like(z)
+                )
+                vision_effect = torch.mean(torch.abs(action - vision_ablated)).item()
+                diagnostics["vision_ablation_effect"].append(float(vision_effect))
+                diagnostics["planning_ablation_share"].append(
+                    float(planning_effect / (planning_effect + vision_effect + 1e-8))
+                )
+
+        for t in range(1, len(frames)):
+            if frames[t]["episode_id"] == frames[t - 1]["episode_id"]:
+                diagnostics["fresh_temporal_change"].append(
+                    float(torch.mean(torch.abs(fresh_actions[t] - fresh_actions[t - 1])).item())
+                )
+
         for delay in delays:
             eligible = [
                 t
@@ -137,13 +192,13 @@ def compute_action_drift(
                 )
                 drift = torch.mean(torch.abs(fresh_actions[t] - stale_action)).item()
                 results[delay].append(float(drift))
-    return dict(results)
+    return dict(results), dict(diagnostics)
 
 
 def plot_results(
     results: Dict[str, Dict[int, List[float]]],
     output_path: Path,
-    checkpoint_step: int,
+    checkpoint_steps: Dict[str, int],
 ) -> None:
     plt.rcParams.update(
         {
@@ -156,10 +211,11 @@ def plot_results(
         }
     )
     fig, (ax_curve, ax_distribution) = plt.subplots(
-        1, 2, figsize=(12.8, 5.0), gridspec_kw={"width_ratios": [1.55, 1.0]}
+        1, 2, figsize=(14.2, 5.2), gridspec_kw={"width_ratios": [1.55, 1.0]}
     )
 
-    for label in ("Single-frame", "CloudEdgeVLA"):
+    labels = [label for label in MODEL_ORDER if label in results]
+    for label in labels:
         delays = sorted(results[label])
         means = np.array([np.mean(results[label][delay]) for delay in delays])
         stds = np.array([np.std(results[label][delay]) for delay in delays])
@@ -167,13 +223,13 @@ def plot_results(
             delays,
             means,
             color=COLORS[label],
-            marker="o" if label == "CloudEdgeVLA" else "s",
+            marker=MARKERS[label],
             ms=7,
             lw=3.0 if label == "CloudEdgeVLA" else 2.3,
-            ls="-" if label == "CloudEdgeVLA" else "--",
+            ls=LINESTYLES[label],
             markeredgecolor="white",
             markeredgewidth=0.8,
-            label=label,
+            label=f"{label} ({checkpoint_steps[label] // 1000}k)",
             zorder=3,
         )
         ax_curve.fill_between(
@@ -210,8 +266,8 @@ def plot_results(
 
     # Raincloud-style summary at the largest tested delay.
     max_delay = max(next(iter(results.values())).keys())
-    distributions = [results[label][max_delay] for label in ("Single-frame", "CloudEdgeVLA")]
-    positions = [0, 1]
+    distributions = [results[label][max_delay] for label in labels]
+    positions = list(range(len(labels)))
     violins = ax_distribution.violinplot(
         distributions,
         positions=positions,
@@ -220,14 +276,14 @@ def plot_results(
         showmedians=False,
         showextrema=False,
     )
-    for body, label in zip(violins["bodies"], ("Single-frame", "CloudEdgeVLA")):
+    for body, label in zip(violins["bodies"], labels):
         body.set_facecolor(COLORS[label])
         body.set_edgecolor("none")
         body.set_alpha(0.25)
 
     rng = np.random.default_rng(42)
     for position, label, values in zip(
-        positions, ("Single-frame", "CloudEdgeVLA"), distributions
+        positions, labels, distributions
     ):
         values_array = np.asarray(values)
         jitter = rng.normal(0.0, 0.045, size=len(values_array))
@@ -253,31 +309,39 @@ def plot_results(
             [position], [quartiles[1]], s=42, color="white", edgecolor=COLORS[label], zorder=5
         )
 
-    baseline_mean = float(np.mean(distributions[0]))
-    ours_mean = float(np.mean(distributions[1]))
-    reduction = (baseline_mean - ours_mean) / baseline_mean * 100.0 if baseline_mean else 0.0
+    ours_mean = float(np.mean(results["CloudEdgeVLA"][max_delay]))
+    comparisons = []
+    for label in labels:
+        if label == "CloudEdgeVLA":
+            continue
+        reference_mean = float(np.mean(results[label][max_delay]))
+        reduction = (reference_mean - ours_mean) / reference_mean * 100.0 if reference_mean else 0.0
+        direction = "lower" if reduction >= 0 else "higher"
+        comparisons.append(f"vs. {label}: {abs(reduction):.1f}% {direction}")
+
     top = max(max(values) for values in distributions)
-    ax_distribution.plot([0, 0, 1, 1], [top * 1.04, top * 1.08, top * 1.08, top * 1.04], color="#334155")
     ax_distribution.text(
-        0.5,
-        top * 1.105,
-        f"{reduction:.1f}% lower drift",
-        ha="center",
-        va="bottom",
-        color="#1E3A8A" if reduction >= 0 else "#991B1B",
-        fontweight="bold",
+        0.98,
+        0.97,
+        "CloudEdgeVLA\n" + "\n".join(comparisons),
+        transform=ax_distribution.transAxes,
+        ha="right",
+        va="top",
+        color="#1E3A8A",
+        fontsize=9.5,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#BFDBFE", "alpha": 0.9},
     )
     ax_distribution.set_title(
         f"(b) Distribution at $d={max_delay}$", loc="left", fontweight="bold"
     )
     ax_distribution.set_xticks(positions)
-    ax_distribution.set_xticklabels(["Single-frame", "CloudEdgeVLA"])
+    ax_distribution.set_xticklabels([label.replace(" ", "\n") for label in labels])
     ax_distribution.set_ylabel("Per-sample normalized action drift")
-    ax_distribution.set_ylim(0, top * 1.22 if top > 0 else 1.0)
+    ax_distribution.set_ylim(0, top * 1.16 if top > 0 else 1.0)
     ax_distribution.grid(axis="y", color="#CBD5E1", alpha=0.55, lw=0.8)
 
     fig.suptitle(
-        f"Fresh–Stale Action Consistency on LIBERO-Goal (matched {checkpoint_step // 1000}k checkpoints)",
+        "Fresh–Stale Action Consistency on LIBERO-Goal (latest available checkpoints)",
         fontsize=16,
         fontweight="bold",
         y=1.02,
@@ -285,7 +349,7 @@ def plot_results(
     fig.text(
         0.5,
         0.035,
-        "Edge vision is fixed at the current frame; only the cloud planning feature is delayed  •  Mean ± 1 SD",
+        "CloudEdge: current edge vision is fixed while cloud features are delayed  •  OFT: cloud-only action head  •  Mean ± 1 SD",
         ha="center",
         color="#64748B",
         fontsize=10,
@@ -298,9 +362,12 @@ def plot_results(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint_oft", required=True)
     parser.add_argument("--checkpoint_baseline", required=True)
     parser.add_argument("--checkpoint_ours", required=True)
-    parser.add_argument("--checkpoint_step", type=int, required=True)
+    parser.add_argument("--checkpoint_oft_step", type=int, required=True)
+    parser.add_argument("--checkpoint_baseline_step", type=int, required=True)
+    parser.add_argument("--checkpoint_ours_step", type=int, required=True)
     parser.add_argument("--delays", type=int, nargs="+", default=DEFAULT_DELAYS)
     parser.add_argument("--num_episodes", type=int, default=2)
     parser.add_argument("--num_frames", type=int, default=35)
@@ -327,14 +394,26 @@ def main() -> None:
     )
 
     results: Dict[str, Dict[int, List[float]]] = {}
-    for label, checkpoint in (
-        ("Single-frame", args.checkpoint_baseline),
-        ("CloudEdgeVLA", args.checkpoint_ours),
-    ):
+    diagnostics: Dict[str, Dict[str, List[float]]] = {}
+    model_specs = (
+        ("OpenVLA-OFT", args.checkpoint_oft, False),
+        ("CloudEdge baseline", args.checkpoint_baseline, True),
+        ("CloudEdgeVLA", args.checkpoint_ours, True),
+    )
+    checkpoint_steps = {
+        "OpenVLA-OFT": args.checkpoint_oft_step,
+        "CloudEdge baseline": args.checkpoint_baseline_step,
+        "CloudEdgeVLA": args.checkpoint_ours_step,
+    }
+    for label, checkpoint, uses_edge_vision in model_specs:
         action_head, hidden, vision = extract_cached_features(
-            checkpoint, observations, args.lora_rank, args.num_views
+            checkpoint,
+            observations,
+            args.lora_rank,
+            args.num_views,
+            uses_edge_vision,
         )
-        results[label] = compute_action_drift(
+        results[label], diagnostics[label] = compute_action_drift(
             action_head,
             observations,
             hidden,
@@ -342,16 +421,21 @@ def main() -> None:
             args.delays,
             args.max_samples_per_task,
         )
+        diagnostic_summary = {
+            name: float(np.mean(values)) for name, values in diagnostics[label].items()
+        }
+        print(f"[DIAGNOSTICS] {label}: {diagnostic_summary}", flush=True)
         del action_head, hidden, vision
         gc.collect()
         torch.cuda.empty_cache()
 
-    plot_results(results, args.output_path, args.checkpoint_step)
+    plot_results(results, args.output_path, checkpoint_steps)
     export = {
         "config": {
+            "checkpoint_oft": args.checkpoint_oft,
             "checkpoint_baseline": args.checkpoint_baseline,
             "checkpoint_ours": args.checkpoint_ours,
-            "checkpoint_step": args.checkpoint_step,
+            "checkpoint_steps": checkpoint_steps,
             "task_suite": "libero_goal",
             "delays": args.delays,
             "num_episodes": args.num_episodes,
@@ -360,6 +444,10 @@ def main() -> None:
             "max_samples_per_task": args.max_samples_per_task,
             "device": args.device,
             "metric": "mean_absolute_normalized_action_drift",
+            "metric_note": (
+                "CloudEdge models hold current edge vision fixed; OpenVLA-OFT has no edge-vision action-head input. "
+                "All cloud hidden states include normalized current proprioception."
+            ),
         },
         "models": {
             label: {
@@ -373,6 +461,19 @@ def main() -> None:
                 for delay, values in model_results.items()
             }
             for label, model_results in results.items()
+        },
+        "diagnostics": {
+            label: {
+                name: {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "median": float(np.median(values)),
+                    "n": len(values),
+                    "values": values,
+                }
+                for name, values in model_diagnostics.items()
+            }
+            for label, model_diagnostics in diagnostics.items()
         },
     }
     json_path = args.output_path.with_name(f"{args.output_path.stem}_data.json")

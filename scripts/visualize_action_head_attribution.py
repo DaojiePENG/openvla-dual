@@ -162,7 +162,8 @@ def load_model(
     lora_rank: int = 32,
     action_head_vision_encoder: str = "siglip-base",
     num_views: int = 2,
-) -> Tuple[nn.Module, VisionActionHead, any, "argparse.Namespace"]:
+    use_vision_action_head: bool = True,
+) -> Tuple[nn.Module, nn.Module, any, "argparse.Namespace"]:
     """
     Returns:
         vla, action_head, processor, cfg
@@ -181,8 +182,11 @@ def load_model(
         center_crop=True,
         load_in_8bit=False,
         load_in_4bit=False,
-        use_vision_action_head=True,
+        use_vision_action_head=use_vision_action_head,
         action_head_vision_encoder=action_head_vision_encoder,
+        # The checkpoint contains the complete VisionActionHead state, including
+        # its frozen SigLIP encoder. Avoid a redundant Hub download before loading it.
+        action_head_vision_pretrained=False,
         freeze_action_head_vision=True,
         action_head_num_views=num_views,
     )
@@ -190,8 +194,30 @@ def load_model(
     from experiments.robot.openvla_utils import get_action_head, get_processor, get_vla
     from experiments.robot.robot_utils import get_model
 
-    vla = get_vla(cfg)
-    processor = get_processor(cfg)
+    checkpoint_path = Path(pretrained_checkpoint)
+    adapter_dir = checkpoint_path / "lora_adapter"
+    adapter_only_checkpoint = (
+        checkpoint_path.is_dir()
+        and not (checkpoint_path / "config.json").is_file()
+        and (adapter_dir / "adapter_config.json").is_file()
+    )
+
+    if adapter_only_checkpoint:
+        # Pruned training checkpoints retain only the LoRA adapter and auxiliary heads. Reconstruct the VLA from the
+        # clean base recorded by PEFT instead of requiring the large merged model shards to be kept for every step.
+        adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text())
+        base_model_path = adapter_config["base_model_name_or_path"]
+        model_cfg = types.SimpleNamespace(**vars(cfg))
+        model_cfg.pretrained_checkpoint = base_model_path
+        print(f"[INFO] Reconstructing pruned checkpoint from base `{base_model_path}` + adapter `{adapter_dir}`")
+        vla = get_vla(model_cfg)
+        from peft import PeftModel
+
+        vla = PeftModel.from_pretrained(vla, adapter_dir).merge_and_unload()
+        processor = get_processor(model_cfg)
+    else:
+        vla = get_vla(cfg)
+        processor = get_processor(cfg)
     action_head = get_action_head(cfg, vla.llm_dim)
 
     # Cast action_head to bfloat16 to match VLA dtype

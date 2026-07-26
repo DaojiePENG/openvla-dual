@@ -231,13 +231,14 @@ class VisionEncoder(nn.Module):
         model_name: str = "siglip-base",
         freeze: bool = True,
         num_views: int = 2,  # primary + wrist
+        pretrained: bool = True,
     ):
         super().__init__()
         self.num_views = num_views
 
         # Load SigLIP model from timm
         timm_model_name = SIGLIP_MODELS.get(model_name, model_name)
-        self.vit = timm.create_model(timm_model_name, pretrained=True, num_classes=0)
+        self.vit = timm.create_model(timm_model_name, pretrained=pretrained, num_classes=0)
 
         # Get embedding dimension
         self.embed_dim = self.vit.embed_dim  # typically 768 for base, 1152 for so400m
@@ -322,6 +323,7 @@ class VisionActionHead(nn.Module):
         vision_encoder_name: str = "siglip-base",
         freeze_vision_encoder: bool = True,
         num_views: int = 2,  # primary + wrist
+        vision_encoder_pretrained: bool = True,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -332,6 +334,7 @@ class VisionActionHead(nn.Module):
             model_name=vision_encoder_name,
             freeze=freeze_vision_encoder,
             num_views=num_views,
+            pretrained=vision_encoder_pretrained,
         )
         vision_embed_dim = self.vision_encoder.embed_dim * num_views
 

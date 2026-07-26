@@ -29,7 +29,7 @@
 GPU_IDS=""
 NUM_GPUS=""
 RUN_ID=""
-RESUME=true
+RESUME=false
 RESUME_FROM_CHECKPOINT="auto"
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -119,15 +119,15 @@ WINDOW_SIZE=21
 # λ linearly ramps from 0 → STALE_LOSS_LAMBDA_MAX over WARMUP steps, then holds.
 # Set WARMUP to -1 for auto (= max_steps/2).
 STALE_LOSS_LAMBDA_MAX=0.5
-STALE_LOSS_WARMUP_STEPS=80000
+STALE_LOSS_WARMUP_STEPS=50000
 
 # Training hyperparameters
 BATCH_SIZE=4                    # Halved from 8: frame_delay does 2 sequential forwards, each uses half the memory
 GRAD_ACCUM_STEPS=1              # Effective batch = 4 * 1 * 2gpus = 8 (same as before)
 LEARNING_RATE=0.0005
 LORA_RANK=16
-MAX_STEPS=200000
-NUM_STEPS_BEFORE_DECAY=100000
+MAX_STEPS=150000
+NUM_STEPS_BEFORE_DECAY=70000
 SAVE_FREQ=10000
 NUM_IMAGES=2
 USE_PROPRIO=true

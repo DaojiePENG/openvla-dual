@@ -31,7 +31,7 @@ set -euo pipefail
 GPU_IDS=""
 NUM_GPUS=""
 RUN_ID=""
-RESUME=true
+RESUME=false
 RESUME_FROM_CHECKPOINT="auto"
 while [[ $# -gt 0 ]]; do
     case $1 in

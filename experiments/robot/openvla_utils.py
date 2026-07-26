@@ -487,6 +487,7 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
                 vision_encoder_name=getattr(cfg, "action_head_vision_encoder", "siglip-base"),
                 freeze_vision_encoder=getattr(cfg, "freeze_action_head_vision", True),
                 num_views=getattr(cfg, "action_head_num_views", 2),
+                vision_encoder_pretrained=getattr(cfg, "action_head_vision_pretrained", True),
             )
         else:
             action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
