@@ -504,7 +504,7 @@ def plot_overview(
         COLORS[CLOUD_LABEL],
     )
     ax_error.axhline(0, color="#94A3B8", lw=0.8)
-    ax_error.set_title("(a) Delay-induced error to demonstrations", loc="left", fontweight="bold")
+    ax_error.set_title("(a)", loc="left", fontweight="bold")
     ax_error.set_xlabel("Cloud-backbone delay $d_h$")
     ax_error.set_ylabel("Excess normalized action MAE")
     ax_error.set_xticks(delays)
@@ -530,7 +530,7 @@ def plot_overview(
     ax_surface.set_yticks(range(len(delays)), delays)
     ax_surface.set_xlabel("Edge-head observation delay $d_z$")
     ax_surface.set_ylabel("Cloud-backbone delay $d_h$")
-    ax_surface.set_title("(b) Backbone–Head counterfactual delay surface", loc="left", fontweight="bold")
+    ax_surface.set_title("(b)", loc="left", fontweight="bold")
     colorbar = fig.colorbar(image, ax=ax_surface, fraction=0.046, pad=0.035)
     colorbar.set_label("Drift from fresh CloudEdge action")
 
@@ -550,7 +550,7 @@ def plot_overview(
         "Backbone stale, Head current",
         COLORS[CLOUD_LABEL],
     )
-    ax_rescue.set_title("(c) Counterfactual edge-age ablation", loc="left", fontweight="bold")
+    ax_rescue.set_title("(c)", loc="left", fontweight="bold")
     ax_rescue.set_xlabel("Delay $d$")
     ax_rescue.set_ylabel("Normalized action drift")
     ax_rescue.set_xticks(delays)
@@ -569,16 +569,10 @@ def plot_overview(
     ax_geometry.set_xticks(nonzero)
     ax_geometry.set_xlabel("Delay $d$")
     ax_geometry.set_ylabel("Fraction / cosine similarity")
-    ax_geometry.set_title("(d) Measured edge-correction signal", loc="left", fontweight="bold")
+    ax_geometry.set_title("(d)", loc="left", fontweight="bold")
     ax_geometry.grid(axis="y", color="#CBD5E1", alpha=0.65, lw=0.8)
     ax_geometry.legend(loc="best")
 
-    fig.suptitle(
-        f"Backbone–Head Counterfactual Delay Audit · {suite_label}",
-        fontsize=16,
-        fontweight="bold",
-        y=0.985,
-    )
     fig.text(
         0.5,
         0.018,
@@ -587,7 +581,7 @@ def plot_overview(
         color="#64748B",
         fontsize=9.5,
     )
-    fig.subplots_adjust(left=0.075, right=0.97, bottom=0.09, top=0.92, hspace=0.34, wspace=0.25)
+    fig.subplots_adjust(left=0.075, right=0.97, bottom=0.09, top=0.97, hspace=0.34, wspace=0.25)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=240, bbox_inches="tight")
     fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
@@ -618,11 +612,12 @@ def _annotate_reduction(
     ours: float,
     delay: int,
     suffix: str = " lower",
+    axes_y: float = 0.07,
 ) -> None:
     reduction = (reference - ours) / (abs(reference) + 1e-8) * 100.0
     ax.text(
         0.97,
-        0.07,
+        axes_y,
         f"at $d={delay}$: {reduction:.1f}%{suffix}",
         transform=ax.transAxes,
         ha="right",
@@ -679,10 +674,6 @@ def _prepare_decomposition_series(
     return series
 
 
-def _panel_title(letter: Optional[str], title: str) -> str:
-    return f"({letter}) {title}" if letter else title
-
-
 def _draw_hidden_panel(
     ax,
     delays: Sequence[int],
@@ -703,11 +694,8 @@ def _draw_hidden_panel(
             marker=marker,
             linestyle=linestyle,
         )
-    ax.set_title(
-        _panel_title(letter, "Backbone: representation staleness"),
-        loc="left",
-        fontweight="bold",
-    )
+    if letter:
+        ax.set_title(f"({letter})", loc="left", fontweight="bold")
     ax.set_xlabel("Backbone image delay $d_h$")
     ax.set_ylabel("Hidden-state cosine distance")
     ax.set_xticks(delays)
@@ -753,11 +741,8 @@ def _draw_transfer_panel(
             linewidth=0,
         )
     nonzero = [delay for delay in delays if delay > 0]
-    ax.set_title(
-        _panel_title(letter, "Head: staleness transfer gain"),
-        loc="left",
-        fontweight="bold",
-    )
+    if letter:
+        ax.set_title(f"({letter})", loc="left", fontweight="bold")
     ax.set_xlabel("Delay $d$")
     ax.set_ylabel(r"$\kappa(d)=D_{action}(d)\,/\,D_{hidden}(d)$")
     ax.set_xticks(nonzero)
@@ -769,6 +754,7 @@ def _draw_transfer_panel(
         series["transfer"][CLOUD_LABEL]["estimate"][-1],
         delay=max(delays),
         suffix=" lower transfer",
+        axes_y=0.16,
     )
 
 
@@ -792,11 +778,8 @@ def _draw_action_panel(
             marker=marker,
             linestyle=linestyle,
         )
-    ax.set_title(
-        _panel_title(letter, "End-to-end: action drift"),
-        loc="left",
-        fontweight="bold",
-    )
+    if letter:
+        ax.set_title(f"({letter})", loc="left", fontweight="bold")
     ax.set_xlabel("Delay $d$")
     ax.set_ylabel("Normalized action drift")
     ax.set_xticks(delays)
@@ -830,11 +813,8 @@ def _draw_demo_panel(
             marker=marker,
             linestyle=linestyle,
         )
-    ax.set_title(
-        _panel_title(letter, "Offline evidence: action error to demos"),
-        loc="left",
-        fontweight="bold",
-    )
+    if letter:
+        ax.set_title(f"({letter})", loc="left", fontweight="bold")
     ax.set_xlabel("Delay $d$")
     ax.set_ylabel("Normalized action MAE")
     ax.set_xticks(delays)
@@ -896,12 +876,6 @@ def plot_backbone_head_decomposition(
     _draw_transfer_panel(axes[0, 1], delays, series, "b")
     _draw_action_panel(axes[1, 0], delays, series, "c")
     _draw_demo_panel(axes[1, 1], delays, series, "d")
-    fig.suptitle(
-        f"Delay Robustness Decomposes into a Stable Backbone and a Contractive Head · {suite_label}",
-        fontsize=16,
-        fontweight="bold",
-        y=0.985,
-    )
     fig.text(
         0.5,
         0.018,
@@ -910,7 +884,7 @@ def plot_backbone_head_decomposition(
         color="#64748B",
         fontsize=9.5,
     )
-    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.09, top=0.92, hspace=0.34, wspace=0.23)
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.09, top=0.97, hspace=0.34, wspace=0.23)
     saved_paths.extend(_save_figure_pair(fig, output_path))
 
     pair_specs = (
@@ -925,18 +899,12 @@ def plot_backbone_head_decomposition(
             (_draw_action_panel, _draw_demo_panel),
         ),
     )
-    for variant, title, draw_functions in pair_specs:
+    for variant, _, draw_functions in pair_specs:
         fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.8))
         for letter, ax, draw_panel in zip(("a", "b"), axes, draw_functions):
             draw_panel(ax, delays, series, letter)
-        fig.suptitle(
-            f"{title} · {suite_label}",
-            fontsize=15,
-            fontweight="bold",
-            y=0.985,
-        )
         fig.text(0.5, 0.018, footer, ha="center", color="#64748B", fontsize=9.0)
-        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.18, top=0.84, wspace=0.24)
+        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.18, top=0.97, wspace=0.24)
         saved_paths.extend(
             _save_figure_pair(fig, _decomposition_variant_path(output_path, variant))
         )
@@ -948,9 +916,9 @@ def plot_backbone_head_decomposition(
         ("demo_mae", _draw_demo_panel),
     )
     for variant, draw_panel in single_specs:
-        fig, ax = plt.subplots(figsize=(6.6, 4.7))
+        fig, ax = plt.subplots(figsize=(6.6, 3.9))
         draw_panel(ax, delays, series, None)
-        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.16, top=0.91)
+        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.19, top=0.98)
         saved_paths.extend(
             _save_figure_pair(fig, _decomposition_variant_path(output_path, variant))
         )
@@ -1034,11 +1002,8 @@ def plot_geometry_and_tasks(
             )
         ax.set_xlabel("Backbone hidden-state cosine distance")
         ax.set_ylabel("Normalized action drift")
-        ax.set_title(
-            _panel_title(letter, "Head attenuation of backbone drift"),
-            loc="left",
-            fontweight="bold",
-        )
+        if letter:
+            ax.set_title(f"({letter})", loc="left", fontweight="bold")
         ax.grid(color="#CBD5E1", alpha=0.55, lw=0.8)
         ax.legend()
 
@@ -1069,11 +1034,8 @@ def plot_geometry_and_tasks(
             fontsize=8,
         )
         ax.set_xlabel(f"Demo action MAE at $d={max_delay}$")
-        ax.set_title(
-            _panel_title(letter, "Per-task delayed action error"),
-            loc="left",
-            fontweight="bold",
-        )
+        if letter:
+            ax.set_title(f"({letter})", loc="left", fontweight="bold")
         ax.grid(axis="x", color="#CBD5E1", alpha=0.55, lw=0.8)
         ax.scatter([], [], color=COLORS[OFT_LABEL], marker="^", label=OFT_LABEL)
         ax.scatter([], [], color=COLORS[CLOUD_LABEL], marker="o", label=CLOUD_LABEL)
@@ -1091,11 +1053,8 @@ def plot_geometry_and_tasks(
             fontsize=8,
         )
         ax.set_xlabel("Demo action MAE reduced")
-        ax.set_title(
-            _panel_title(letter, f"Per-task robustness gain at $d={max_delay}$"),
-            loc="left",
-            fontweight="bold",
-        )
+        if letter:
+            ax.set_title(f"({letter})", loc="left", fontweight="bold")
         ax.grid(axis="x", color="#CBD5E1", alpha=0.55, lw=0.8)
 
     saved_paths: List[Path] = []
@@ -1106,13 +1065,7 @@ def plot_geometry_and_tasks(
     draw_task_error(axes[1], "b")
     draw_task_gain(axes[2], "c")
 
-    fig.suptitle(
-        f"Feature-to-Action Delay Geometry on {suite_label}",
-        fontsize=15.5,
-        fontweight="bold",
-        y=0.99,
-    )
-    fig.subplots_adjust(left=0.055, right=0.99, bottom=0.13, top=0.88, wspace=0.53)
+    fig.subplots_adjust(left=0.055, right=0.99, bottom=0.13, top=0.96, wspace=0.53)
     saved_paths.extend(_save_figure_pair(fig, output_path))
 
     single_specs = (
@@ -1167,10 +1120,7 @@ def plot_action_chunk_rescue(
     shared_colorbar_ax = fig.add_subplot(grid[0, 2])
     suppression_colorbar_ax = fig.add_subplot(grid[0, 4])
     shared_max = float(max(oft_error.max(), cloud_current_error.max()))
-    titles = [
-        "(a) OFT: stale backbone",
-        "(b) CloudEdgeVLA: stale backbone",
-    ]
+    titles = ["(a)", "(b)"]
     matrices = [oft_error, cloud_current_error]
     last_image = None
     for ax, title, matrix in zip(axes[:2], titles, matrices):
@@ -1192,7 +1142,7 @@ def plot_action_chunk_rescue(
         aspect="auto",
         origin="upper",
     )
-    axes[2].set_title("(c) Drift suppressed by training", loc="left", fontweight="bold")
+    axes[2].set_title("(c)", loc="left", fontweight="bold")
     axes[2].set_xticks(range(ACTION_DIM), ACTION_LABELS, rotation=35, ha="right")
     axes[2].set_yticks(range(NUM_ACTIONS_CHUNK), [f"t+{i}" for i in range(NUM_ACTIONS_CHUNK)])
     axes[2].set_yticklabels([])
@@ -1203,12 +1153,6 @@ def plot_action_chunk_rescue(
         label="OFT drift − CloudEdgeVLA drift",
     )
 
-    fig.suptitle(
-        f"Delay Training Suppresses {max_delay}-Step Staleness across the Action Chunk · {suite_label}",
-        fontsize=15.5,
-        fontweight="bold",
-        y=0.97,
-    )
     saved_paths = _save_figure_pair(fig, output_path)
 
     single_specs = (
@@ -1252,7 +1196,6 @@ def plot_action_chunk_rescue(
             origin="upper",
             **image_kwargs,
         )
-        ax.set_title(title, loc="left", fontweight="bold")
         ax.set_xticks(range(ACTION_DIM), ACTION_LABELS, rotation=35, ha="right")
         ax.set_yticks(
             range(NUM_ACTIONS_CHUNK),

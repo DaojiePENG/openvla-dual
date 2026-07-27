@@ -1,7 +1,9 @@
 #!/bin/bash
-# Local evaluation for frame-delay VisionActionHead checkpoints on LIBERO Goal.
+# Local evaluation for frame-delay VisionActionHead checkpoints on LIBERO suites.
 
 set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 GPU_IDS="0,1"
 NUM_TRIALS=50
@@ -9,12 +11,26 @@ STAGGER_DELAY=30
 TASKS_PER_GPU=4
 DELAYS_CSV="0,5,10,15,20"
 CHECKPOINT="${EVAL_CHECKPOINT:-}"
+TASK_SUITE_NAME="libero_goal"
 SEED=7
 MAX_TRAIN_DELAY=20
+RESPECT_EXISTING_EVALUATORS=false
+MIN_GPU_FREE_MIB=0
+MIN_RAM_AVAILABLE_KIB=0
+MIN_DISK_FREE_KIB=0
+RESOURCE_POLL_SECONDS=30
+WAIT_LOG_SECONDS=300
+SAVE_ROLLOUTS=true
+LOG_DIR_OVERRIDE=""
 
 usage() {
     echo "Usage: $0 --checkpoint PATH [--gpus 0,1] [--num_trials 50] [--delays 0,5,10,15,20]"
-    echo "          [--tasks_per_gpu 4] [--stagger 30] [--seed 7]"
+    echo "          [--task_suite_name libero_goal] [--tasks_per_gpu 4] [--stagger 30] [--seed 7]"
+    echo "          [--respect_existing_evaluators true] [--min_gpu_free_mib 20000]"
+    echo "          [--min_ram_available_kib 67108864] [--min_disk_free_kib 10737418240]"
+    echo "          [--resource_poll_seconds 30] [--wait_log_seconds 300]"
+    echo "          [--save_rollouts true|false]"
+    echo "          [--log_dir PATH]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -23,9 +39,18 @@ while [[ $# -gt 0 ]]; do
         --gpus) GPU_IDS="$2"; shift 2 ;;
         --num_trials) NUM_TRIALS="$2"; shift 2 ;;
         --delays) DELAYS_CSV="$2"; shift 2 ;;
+        --task_suite_name) TASK_SUITE_NAME="$2"; shift 2 ;;
         --tasks_per_gpu) TASKS_PER_GPU="$2"; shift 2 ;;
         --stagger) STAGGER_DELAY="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
+        --respect_existing_evaluators) RESPECT_EXISTING_EVALUATORS="$2"; shift 2 ;;
+        --min_gpu_free_mib) MIN_GPU_FREE_MIB="$2"; shift 2 ;;
+        --min_ram_available_kib) MIN_RAM_AVAILABLE_KIB="$2"; shift 2 ;;
+        --min_disk_free_kib) MIN_DISK_FREE_KIB="$2"; shift 2 ;;
+        --resource_poll_seconds) RESOURCE_POLL_SECONDS="$2"; shift 2 ;;
+        --wait_log_seconds) WAIT_LOG_SECONDS="$2"; shift 2 ;;
+        --save_rollouts) SAVE_ROLLOUTS="$2"; shift 2 ;;
+        --log_dir) LOG_DIR_OVERRIDE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -73,6 +98,24 @@ if [[ ${#DELAY_ARRAY[@]} -eq 0 ]]; then
     echo "ERROR: At least one evaluation delay is required."
     exit 1
 fi
+if [[ "$RESPECT_EXISTING_EVALUATORS" != "true" && "$RESPECT_EXISTING_EVALUATORS" != "false" ]]; then
+    echo "ERROR: --respect_existing_evaluators must be true or false."
+    exit 1
+fi
+if [[ "$SAVE_ROLLOUTS" != "true" && "$SAVE_ROLLOUTS" != "false" ]]; then
+    echo "ERROR: --save_rollouts must be true or false."
+    exit 1
+fi
+for LIMIT in "$MIN_GPU_FREE_MIB" "$MIN_RAM_AVAILABLE_KIB" "$MIN_DISK_FREE_KIB" "$RESOURCE_POLL_SECONDS" "$WAIT_LOG_SECONDS"; do
+    if [[ ! "$LIMIT" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Resource safety thresholds must be non-negative integers."
+        exit 1
+    fi
+done
+if (( RESOURCE_POLL_SECONDS < 1 || WAIT_LOG_SECONDS < 1 )); then
+    echo "ERROR: Resource polling and wait logging intervals must be at least 1 second."
+    exit 1
+fi
 
 for DELAY in "${DELAY_ARRAY[@]}"; do
     if [[ ! "$DELAY" =~ ^[0-9]+$ ]]; then
@@ -98,12 +141,17 @@ COMMON_ARGS=(
     --action_head_vision_encoder siglip-base
     --freeze_action_head_vision True
     --action_head_num_views 2
-    --task_suite_name libero_goal
+    --task_suite_name "$TASK_SUITE_NAME"
     --seed "$SEED"
+    --save_rollouts "$SAVE_ROLLOUTS"
 )
 
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-LOG_DIR="logs/eval_frame_delay_local_${TIMESTAMP}"
+if [[ -n "$LOG_DIR_OVERRIDE" ]]; then
+    LOG_DIR="$LOG_DIR_OVERRIDE"
+else
+    LOG_DIR="logs/eval_frame_delay_local_${TIMESTAMP}"
+fi
 mkdir -p "$LOG_DIR"
 START_SECONDS=$SECONDS
 
@@ -119,6 +167,7 @@ RUNNING=0
 SUCCEEDED=0
 FAILED=0
 SELECTED_GPU_IDX=0
+LAST_WAIT_LOG_SECONDS=0
 
 stop_children() {
     trap - INT TERM
@@ -163,25 +212,99 @@ reap_finished() {
     done
 }
 
-select_available_gpu() {
-    while true; do
-        reap_finished
-        for ((i=0; i<NUM_GPUS; i++)); do
-            if (( GPU_SLOTS[i] < TASKS_PER_GPU )); then
-                SELECTED_GPU_IDX=$i
-                return
+gpu_has_libero_evaluator() {
+    local target_gpu=$1
+    local pid visible gpu
+    local saw_unknown=false
+
+    while read -r pid; do
+        [[ -n "$pid" && -r "/proc/$pid/environ" ]] || continue
+        visible=$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -n 1)
+        if [[ -z "$visible" ]]; then
+            saw_unknown=true
+            continue
+        fi
+        IFS=',' read -r -a visible_gpus <<< "$visible"
+        for gpu in "${visible_gpus[@]}"; do
+            if [[ "$gpu" == "$target_gpu" ]]; then
+                return 0
             fi
         done
-        sleep 2
+    done < <(pgrep -u "$(id -u)" -f '[r]un_libero_eval.py' || true)
+
+    # An evaluator whose physical GPU cannot be identified is treated
+    # conservatively as occupying every candidate GPU.
+    [[ "$saw_unknown" == "true" ]]
+}
+
+global_resources_allow_launch() {
+    local ram_available_kib disk_free_kib
+
+    if (( MIN_RAM_AVAILABLE_KIB > 0 )); then
+        ram_available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+        [[ "$ram_available_kib" =~ ^[0-9]+$ ]] || return 1
+        (( ram_available_kib >= MIN_RAM_AVAILABLE_KIB )) || return 1
+    fi
+
+    if (( MIN_DISK_FREE_KIB > 0 )); then
+        disk_free_kib=$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')
+        [[ "$disk_free_kib" =~ ^[0-9]+$ ]] || return 1
+        (( disk_free_kib >= MIN_DISK_FREE_KIB )) || return 1
+    fi
+
+    return 0
+}
+
+gpu_resources_allow_launch() {
+    local gpu_id=$1
+    local free_mib
+
+    if (( MIN_GPU_FREE_MIB > 0 )); then
+        free_mib=$(nvidia-smi --id="$gpu_id" --query-gpu=memory.free --format=csv,noheader,nounits | head -n 1)
+        [[ "$free_mib" =~ ^[0-9]+$ ]] || return 1
+        (( free_mib >= MIN_GPU_FREE_MIB )) || return 1
+    fi
+
+    return 0
+}
+
+select_available_gpu() {
+    local now gpu_id
+    while true; do
+        reap_finished
+        if global_resources_allow_launch; then
+            for ((i=0; i<NUM_GPUS; i++)); do
+                (( GPU_SLOTS[i] < TASKS_PER_GPU )) || continue
+                gpu_id=${GPU_ARRAY[$i]}
+                if [[ "$RESPECT_EXISTING_EVALUATORS" == "true" ]] && gpu_has_libero_evaluator "$gpu_id"; then
+                    continue
+                fi
+                gpu_resources_allow_launch "$gpu_id" || continue
+                SELECTED_GPU_IDX=$i
+                return
+            done
+        fi
+        now=$SECONDS
+        if (( now - LAST_WAIT_LOG_SECONDS >= WAIT_LOG_SECONDS )); then
+            echo "[$(date '+%H:%M:%S')] Waiting for an evaluator-free GPU and safe GPU/RAM/storage headroom..."
+            LAST_WAIT_LOG_SECONDS=$now
+        fi
+        sleep "$RESOURCE_POLL_SECONDS"
     done
 }
 
 echo "============================================================"
-echo "Frame Delay Evaluation: LIBERO Goal"
+echo "Frame Delay Evaluation: $TASK_SUITE_NAME"
 echo "Checkpoint: $(basename "$CHECKPOINT")"
 echo "GPUs: $GPU_IDS | tasks/GPU: $TASKS_PER_GPU"
 echo "Delays (environment steps): $DELAYS_CSV"
 echo "Trials per task: $NUM_TRIALS | seed: $SEED"
+echo "Save rollout videos: $SAVE_ROLLOUTS"
+echo "Respect existing evaluators: $RESPECT_EXISTING_EVALUATORS"
+if [[ "$RESPECT_EXISTING_EVALUATORS" == "true" ]]; then
+    echo "Safety thresholds: GPU ${MIN_GPU_FREE_MIB} MiB free, RAM ${MIN_RAM_AVAILABLE_KIB} KiB available, disk ${MIN_DISK_FREE_KIB} KiB free"
+    echo "Resource polling: every ${RESOURCE_POLL_SECONDS}s | wait status: every ${WAIT_LOG_SECONDS}s"
+fi
 echo "Logs: $LOG_DIR"
 echo "============================================================"
 
@@ -201,6 +324,11 @@ for TASK_IDX in "${!DELAY_ARRAY[@]}"; do
     GPU_ID=${GPU_ARRAY[$GPU_IDX]}
     TASK_LOG="$LOG_DIR/${LABEL}.log"
     TASK_ERR="$LOG_DIR/${LABEL}.err"
+
+    if [[ -e "$TASK_LOG" || -e "$TASK_ERR" ]]; then
+        echo "ERROR: Refusing to overwrite existing logs for $LABEL in $LOG_DIR"
+        exit 1
+    fi
 
     echo "[$(date '+%H:%M:%S')] Task $((TASK_IDX + 1))/$TOTAL_TASKS: delay=$DELAY -> GPU $GPU_ID"
     CUDA_VISIBLE_DEVICES="$GPU_ID" python "$EVAL_SCRIPT" \

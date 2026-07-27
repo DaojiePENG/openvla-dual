@@ -132,6 +132,7 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    save_rollouts: bool = True                       # Whether to cache frames and encode rollout MP4 videos
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -347,7 +348,8 @@ def run_episode(
 
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
+            if cfg.save_rollouts:
+                replay_images.append(img)
 
             if use_frame_delay:
                 current_images = [observation["full_image"]]
@@ -499,10 +501,12 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
-        )
+        # Save replay video only when explicitly enabled. Large evaluation sweeps
+        # can skip frame caching and MP4 encoding to reduce CPU, memory, and I/O.
+        if cfg.save_rollouts:
+            save_rollout_video(
+                replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)
